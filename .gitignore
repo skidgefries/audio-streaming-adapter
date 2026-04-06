@@ -1,5 +1,7 @@
 # Python
 __pycache__/
+notebooks/.ipynb_checkpoints/
+src/__pycache__/
 *.py[cod]
 *.egg-info/
 dist/
@@ -44,3 +46,15 @@ outputs/
 
 # Misc
 .qodo/
+__p
+__pycache__
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+whisper_venv/
+.venv/
