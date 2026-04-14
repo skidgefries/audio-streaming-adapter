@@ -54,6 +54,10 @@ Target: ~1-3 tokens/sec (2 minutes ≈ 240 tokens vs. 3000+ frames)
 4. Tokens appended to LLM context (KV-cache friendly)
 5. LLM generates early and continues as more tokens arrive
 
+**Implementation note (current codebase):**
+- Encoder outputs are windowed using `adapter/windowing.py::WhisperFrameWindowizer` over the encoder time axis.
+- For training notebooks, `adapter/adapter_llm_pipeline.py::whisper_waveform_to_encoder_windows(...)` runs the full-utterance Whisper encoder pass and then applies the `WhisperFrameWindowizer`.
+
 ---
 
 ## Component 2: Streaming Adapter Network
@@ -65,6 +69,10 @@ Each layer has three sub-layers:
 1. **Self-Attention** (Q ↔ Q): Queries attend to each other — coordination to avoid redundancy
 2. **Cross-Attention** (Q → F): Queries attend to encoder frames — information extraction
 3. **FFN**: Per-token nonlinear transformation
+
+**Implementation note (current codebase):**
+- The per-layer module is implemented in `src/adapter/cross_attention.py` as `QFormerLayer`.
+- `src/adapter/streaming_adapter.py` stacks these layers and can insert self-only layers between cross-attention layers (see below).
 
 ### Why Cross-Attention with Learnable Queries?
 
@@ -99,6 +107,16 @@ Dynamically adjusts how many of the m query slots to use per window:
 - Produces two losses:
   - **L_sparse**: L1 on gate scores — encourages using fewer tokens
   - **L_rate**: MSE between effective token count and target rate
+
+### Cross-attention placement across layers (current implementation)
+
+`StreamingAdapter` supports inserting **self-attention-only** layers between cross-attention layers.
+
+- Parameter: `cross_layer_in_between = K`
+- Period: `P = K + 1`
+- **Cross-attention runs at the end of each block**: layer `i` uses cross-attention iff `i % P == P - 1`
+  - Example `K=1` → cross-attn on layers `1, 3, 5, ...` (layer 0 is self-only)
+  - `K=0` → every layer uses cross-attention
 
 ---
 
@@ -157,6 +175,15 @@ L = L_task + λ_asr · L_asr + λ_stability · L_stability + λ_rate · L_rate +
 
 **Note**: Prefix consistency and revision penalty require the LLM in the loop,
 so they are implemented in the training pipeline, not in the adapter itself.
+
+---
+
+## Checkpoint + inference wiring (current notebooks)
+
+- Training checkpoints are written under `audio-streaming-adapter/checkpoints/` when you run trainers from the `audio-streaming-adapter/` directory (see `training/utils/config.py` / each stage script).
+- `notebooks/adapter_llm_walkthrough.ipynb` can load a trained adapter checkpoint via the env var:
+  - `ADAPTER_CHECKPOINT_PATH="checkpoints/adapter_adapter.pt"`
+  - The notebook loads `adapter_state_dict` / `model_state_dict` / `state_dict` (first one present) into the `StreamingAdapter` before generation.
 
 ---
 

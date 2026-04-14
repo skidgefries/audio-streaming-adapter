@@ -2,9 +2,10 @@
 
 import torch
 import sys
-sys.path.insert(0, ".")
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from src.adapter import (
+from adapter import (
     QFormerLayer,
     StabilityBuffer,
     AdaptiveRateController,
@@ -69,6 +70,21 @@ def test_early_commit_gate():
     assert (result["commit_prob"] >= 0).all() and (result["commit_prob"] <= 1).all()
     print(f"[PASS] EarlyCommitGate: commit_prob={result['commit_prob'][:, 0].tolist()}, "
           f"gate_loss={result['gate_loss'].item():.4f}")
+
+
+def test_cross_layer_in_between_pattern():
+    """With K>0, first layer is self-only; cross runs at 1,3,… for K=1."""
+    adapter = StreamingAdapter(
+        d_encoder=1024,
+        d_llm=2560,
+        num_queries=4,
+        num_layers=4,
+        cross_layer_in_between=1,
+        use_rate_controller=False,
+    )
+    period = adapter.cross_layer_in_between + 1
+    for i, layer in enumerate(adapter.layers):
+        assert layer.use_cross_attention == (i % period == period - 1)
 
 
 def test_adapter_without_rate_controller():
@@ -186,6 +202,7 @@ def test_parameter_count():
 
 if __name__ == "__main__":
     test_qformer_layer()
+    test_cross_layer_in_between_pattern()
     test_stability_buffer()
     test_rate_controller()
     test_early_commit_gate()

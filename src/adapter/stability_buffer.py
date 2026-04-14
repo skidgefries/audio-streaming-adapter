@@ -70,7 +70,8 @@ class StabilityBuffer(nn.Module):
             return tokens, zero_loss
 
         # Stability loss: penalize large jumps between adjacent windows
-        stability_loss = torch.mean((tokens - self._prev_tokens) ** 2)
+        # Compute in float32 for numerical stability with float16 models
+        stability_loss = torch.mean((tokens - self._prev_tokens).float() ** 2)
 
         # EMA smoothing
         alpha = self.alpha

@@ -57,7 +57,6 @@ class QFormerLayer(nn.Module):
         num_heads: int = 4,
         d_ffn: int = 2048,
         dropout: float = 0.1,
-        use_cross_attention: bool = True,
     ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -65,7 +64,6 @@ class QFormerLayer(nn.Module):
         self.num_heads = num_heads
         self.d_head = d_model // num_heads
         self.scale = math.sqrt(self.d_head)
-        self.use_cross_attention = use_cross_attention
 
         # ---- Sub-layer 1: Self-Attention (queries ↔ queries) ----
         self.self_attn_q = nn.Linear(d_model, d_model)
@@ -76,14 +74,13 @@ class QFormerLayer(nn.Module):
         self.self_attn_dropout = nn.Dropout(dropout)
 
         # ---- Sub-layer 2: Cross-Attention (queries → encoder frames) ----
-        if use_cross_attention:
-            self.cross_attn_q = nn.Linear(d_model, d_model)
-            self.cross_attn_k = nn.Linear(d_model, d_model)
-            self.cross_attn_v = nn.Linear(d_model, d_model)
-            self.cross_attn_o = nn.Linear(d_model, d_model)
-            self.norm_cross_q = nn.LayerNorm(d_model)
-            self.norm_cross_kv = nn.LayerNorm(d_model)
-            self.cross_attn_dropout = nn.Dropout(dropout)
+        self.cross_attn_q = nn.Linear(d_model, d_model)
+        self.cross_attn_k = nn.Linear(d_model, d_model)
+        self.cross_attn_v = nn.Linear(d_model, d_model)
+        self.cross_attn_o = nn.Linear(d_model, d_model)
+        self.norm_cross_q = nn.LayerNorm(d_model)
+        self.norm_cross_kv = nn.LayerNorm(d_model)
+        self.cross_attn_dropout = nn.Dropout(dropout)
 
         # ---- Sub-layer 3: Feed-Forward Network ----
         self.ffn = nn.Sequential(
@@ -174,6 +171,7 @@ class QFormerLayer(nn.Module):
         queries = queries + self.ffn(self.norm_ffn(queries))  # residual
 
         return queries
+
 
 # Keep backward-compatible name
 CrossAttentionLayer = QFormerLayer

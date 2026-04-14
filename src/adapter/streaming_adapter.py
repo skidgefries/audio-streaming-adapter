@@ -17,6 +17,9 @@ Pipeline per window:
 
 Chunked streaming: 0.8s window / 0.4s stride (50% overlap)
 Target: 1-3 tokens/sec (2 min ≈ 240 tokens vs. 3000+ frames)
+
+When cross_layer_in_between > 0, cross-attention is placed at the end of each
+period block (not on layer 0), so the first layer is self-attention-only.
 """
 
 import torch
@@ -48,6 +51,13 @@ class StreamingAdapter(nn.Module):
                              Set False for initial experiments (fixed m tokens/window).
         rate_threshold: Hard gate threshold for inference (if rate controller enabled).
         target_rate: Target average tokens per window (if rate controller enabled).
+        cross_layer_in_between: Number of self-attention-only layers (self + FFN, no
+            cross-attention to audio) between successive cross-attention layers.
+            0 means every layer includes cross-attention (full Q-Former stack).
+            For K > 0, let P = K + 1. Cross-attention runs at the *end* of each block of
+            P layers: layer index i uses cross-attention iff i % P == P - 1 (e.g. K=1 →
+            cross on layers 1, 3, 5, … and self-only on 0, 2, 4, … so the stack does not
+            start with cross-attention).
     """
 
     def __init__(
@@ -64,26 +74,46 @@ class StreamingAdapter(nn.Module):
         use_rate_controller: bool = False,
         rate_threshold: float = 0.5,
         target_rate: float = 2.0,
+        cross_layer_in_between: int = 1,
     ):
         super().__init__()
+        if cross_layer_in_between < 0:
+            raise ValueError("cross_layer_in_between must be >= 0")
         self.d_encoder = d_encoder
         self.d_llm = d_llm
         self.num_queries = num_queries
         self.use_rate_controller = use_rate_controller
+        self.cross_layer_in_between = cross_layer_in_between
 
         # Learnable query vectors Q ∈ R^{m × D_q}
         self.queries = nn.Parameter(torch.randn(1, num_queries, d_encoder) * 0.02)
 
-        # Stack of Q-Former layers (self-attn + cross-attn + FFN, BLIP-2 style)
+        # # Stack of Q-Former layers (self-attn + cross-attn + FFN, BLIP-2 style)
+        # self.layers = nn.ModuleList([
+        #     QFormerLayer(
+        #         d_model=d_encoder,
+        #         num_heads=num_heads,
+        #         d_ffn=d_ffn,
+        #         dropout=dropout,
+        #     )
+        #     for _ in range(num_layers)
+        # ])
+
+        # Stacked layers: optional self-only layers between cross-attention layers.
+        # period P = K+1: cross at i ≡ P-1 (mod P) — last slot in each block, so layer 0
+        # is self-only when K>0 (e.g. K=1 → cross on 1,3,5,... not 0,2,4,...).
+        period = cross_layer_in_between + 1
         self.layers = nn.ModuleList([
             QFormerLayer(
                 d_model=d_encoder,
                 num_heads=num_heads,
                 d_ffn=d_ffn,
                 dropout=dropout,
+                use_cross_attention=(i % period == period - 1),
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ])
+
 
         # Project from encoder space to LLM embedding space
         self.output_proj = nn.Sequential(
@@ -126,7 +156,10 @@ class StreamingAdapter(nn.Module):
             dict with:
                 tokens: (batch, m, d_llm) -- compressed, smoothed tokens
                 stability_loss: scalar -- L_stability (temporal consistency)
-                gate_scores: (batch, m) -- rate gate values (None if no rate controller)
+                gate_scores: (batch, m) -- **rate-controller** gate values only
+                    (None if no rate controller). This is unrelated to
+                    :class:`~adapter.early_commit_gate.EarlyCommitGate`; training
+                    ``L_gate`` uses the early-commit gate, not these scores.
                 sparse_loss: scalar -- L_sparse (None if no rate controller)
                 rate_loss: scalar -- L_rate (None if no rate controller)
         """
