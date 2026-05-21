@@ -35,6 +35,46 @@ class LibriSpeechPairs(Dataset):
         return self.pairs[idx]
 
 
+
+# tst if the loss is working with a subset of the dataset
+class LibriSpeechPairsCustom(Dataset):
+    """LibriSpeech dataset with specific audio files by file ID."""
+
+    def __init__(self, dataset_root: str, file_ids: list[str]):
+        self.dataset_root = dataset_root
+        self.pairs: list[tuple[str, str]] = []
+        
+        # Build a lookup of all available pairs first
+        all_pairs: dict[str, tuple[str, str]] = {}
+        for trans_file in glob.glob(f"{dataset_root}/**/*.trans.txt", recursive=True):
+            folder = os.path.dirname(trans_file)
+            with open(trans_file) as f:
+                for line in f:
+                    parts = line.strip().split(" ", 1)
+                    if len(parts) != 2:
+                        continue
+                    file_id, transcription = parts
+                    audio_path = os.path.join(folder, f"{file_id}.flac")
+                    if os.path.exists(audio_path):
+                        all_pairs[file_id] = (audio_path, transcription)
+
+        # Only keep the requested file IDs
+        for fid in file_ids:
+            if fid in all_pairs:
+                self.pairs.append(all_pairs[fid])
+            else:
+                print(f"[WARN] file_id '{fid}' not found in dataset")
+
+        print(f"Found {len(self.pairs)}/{len(file_ids)} requested pairs")
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -> tuple[str, str]:
+        return self.pairs[idx]
+
+
+
 def load_mono_waveform_16k(audio_path: str) -> torch.Tensor:
     """Load audio with librosa and resample to 16k mono. Returns CPU float tensor."""
     import librosa

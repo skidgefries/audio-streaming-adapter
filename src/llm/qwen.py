@@ -24,6 +24,7 @@ def load_qwen_models(
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.float16,
     device_map: str | dict | None = "auto",
+    max_memory: dict[int, str] | None = None,
     embeddings_only: bool = False,
 ) -> QwenModels:
     """
@@ -38,32 +39,29 @@ def load_qwen_models(
         device = cfg.device
         torch_dtype = cfg.torch_dtype
         device_map = cfg.device_map
+        max_memory = cfg.max_memory
         embeddings_only = cfg.embeddings_only
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    load_kw: dict = dict(
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        device_map=device_map,
+    )
+    if max_memory is not None:
+        load_kw["max_memory"] = max_memory
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
     if embeddings_only:
-        model = AutoModel.from_pretrained(
-            model_id,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            device_map=device_map,
-        )
+        model = AutoModel.from_pretrained(model_id, **load_kw)
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
         embedder = model.get_input_embeddings()
         return QwenModels(model_id=model_id, tokenizer=tokenizer, causal_lm=None, embedder=embedder)
 
-    causal_lm = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        use_safetensors=True,
-        device_map=device_map,
-    )
+    causal_lm = AutoModelForCausalLM.from_pretrained(model_id, use_safetensors=True, **load_kw)
     causal_lm.eval()
     for p in causal_lm.parameters():
         p.requires_grad = False

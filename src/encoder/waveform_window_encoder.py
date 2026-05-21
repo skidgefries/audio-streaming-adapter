@@ -44,6 +44,7 @@ class WhisperWindowFeatureExtractor:
         self.window_seconds = float(window_seconds)
         self.stride_seconds = float(stride_seconds)
         self.sample_rate = int(sample_rate)
+        self.chunk_seconds_override = None
 
         wm = load_whisper_models(model_id=model_id, device=device, torch_dtype=torch_dtype)
         self.processor = wm.processor
@@ -70,6 +71,7 @@ class WhisperWindowFeatureExtractor:
         if chunk_s <= 0:
             return []
 
+        dev = torch.device(self.device)
         enc = encode_waveform_to_hidden(
             wave,
             whisper_processor=self.processor,
@@ -77,7 +79,7 @@ class WhisperWindowFeatureExtractor:
             device=self.device,
             torch_dtype=self.torch_dtype,
             sample_rate=self.sample_rate,
-        )
+        ).to(device=dev, dtype=self.torch_dtype)
 
         windowizer = WhisperFrameWindowizer(
             window_seconds=self.window_seconds,
@@ -89,4 +91,7 @@ class WhisperWindowFeatureExtractor:
             return []
 
         n = windows.shape[1]
-        return [windows[0, i].unsqueeze(0).contiguous() for i in range(n)]
+        return [
+            windows[0, i].unsqueeze(0).to(device=dev, dtype=self.torch_dtype).contiguous()
+            for i in range(n)
+        ]

@@ -9,6 +9,7 @@ def contrastive_infonce_loss(
     audio_tokens: torch.Tensor,
     text_embeddings: torch.Tensor,
     temperature: float,
+    return_diagnostics: bool = False
 ) -> torch.Tensor:
     """
     InfoNCE loss on pooled representations.
@@ -17,11 +18,29 @@ def contrastive_infonce_loss(
     text_embeddings: (B, T_t, D)
     """
     b = audio_tokens.shape[0]
-    a = F.normalize(audio_tokens.float().mean(dim=1), dim=-1)
-    t = F.normalize(text_embeddings.float().mean(dim=1), dim=-1)
+    a_pooled = audio_tokens.float().mean(dim=1)
+    t_pooled = text_embeddings.float().mean(dim=1) 
+    a_pooled = a_pooled - a_pooled.mean(dim=0, keepdim=True)
+    t_pooled = t_pooled - t_pooled.mean(dim=0, keepdim=True)     
+    a = F.normalize(a_pooled, dim=-1)
+    t = F.normalize(t_pooled, dim=-1)   
+    # a = F.normalize(audio_tokens.float().mean(dim=1), dim=-1)
+    # t = F.normalize(text_embeddings.float().mean(dim=1), dim=-1)
     logits = (a @ t.T) / float(temperature)
-    return F.cross_entropy(logits, torch.arange(b, device=logits.device))
+    loss =  F.cross_entropy(logits, torch.arange(b, device=logits.device))
+    
+    if return_diagnostics:
+        with torch.no_grad():
+            sim_matrix = a @ t.T  # (B, B) — cosine similarities
+            pos_sim = sim_matrix.diagonal().mean().item()         # mean of diagonal
+            neg_sim = (sim_matrix.sum() - sim_matrix.diagonal().sum()) / (b * b - b)  # mean off-diagonal
+            neg_sim = neg_sim.item()
+            pos_minus_neg = pos_sim - neg_sim
+            audio_std = a.std(dim=0).mean().item()   
+            text_std = t.std(dim=0).mean().item() 
+        return loss, {"pos_sim": pos_sim, "neg_sim": neg_sim, "pos_minus_neg": pos_minus_neg, "audio_std": audio_std, "text_std": text_std}
 
+    return loss
 
 def kl_distill_loss(
     *,

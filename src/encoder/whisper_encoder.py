@@ -67,7 +67,12 @@ def encode_waveform_to_hidden(
 
     with torch.no_grad():
         encoder_outputs = whisper_model.model.encoder(input_features)
-    return encoder_outputs.last_hidden_state
+    # Keep hidden states on the Whisper device (matches adapter / train stack on cuda:0).
+    out = encoder_outputs.last_hidden_state
+    target = next(whisper_model.parameters()).device
+    if out.device != target or out.dtype != torch_dtype:
+        out = out.to(device=target, dtype=torch_dtype)
+    return out
 
 
 # --- File / dataset helpers (used by qwen_summarize_*.py demos) -----------------

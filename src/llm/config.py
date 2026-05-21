@@ -14,6 +14,7 @@ class QwenConfig:
     device: str = "cuda"
     torch_dtype: torch.dtype = torch.float16
     device_map: str | dict | None = "auto"
+    max_memory: dict[int, str] | None = None
     embeddings_only: bool = False
 
 

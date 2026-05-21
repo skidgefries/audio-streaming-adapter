@@ -26,26 +26,38 @@ def load_frozen_whisper(*, model_id: str, device: str, torch_dtype: torch.dtype)
 
 
 def load_frozen_qwen_embeddings(
-    *, model_id: str, device: str, torch_dtype: torch.dtype, device_map="auto"
+    *,
+    model_id: str,
+    device: str,
+    torch_dtype: torch.dtype,
+    device_map="auto",
+    max_memory: dict[int, str] | None = None,
 ) -> QwenModels:
     cfg = QwenConfig(
         model_id=model_id,
         device=device,
         torch_dtype=torch_dtype,
         device_map=device_map,
+        max_memory=max_memory,
         embeddings_only=True,
     )
     return load_qwen_models(cfg=cfg)
 
 
 def load_frozen_qwen_causal_lm(
-    *, model_id: str, device: str, torch_dtype: torch.dtype, device_map="auto"
+    *,
+    model_id: str,
+    device: str,
+    torch_dtype: torch.dtype,
+    device_map="auto",
+    max_memory: dict[int, str] | None = None,
 ) -> QwenModels:
     cfg = QwenConfig(
         model_id=model_id,
         device=device,
         torch_dtype=torch_dtype,
         device_map=device_map,
+        max_memory=max_memory,
         embeddings_only=False,
     )
     return load_qwen_models(cfg=cfg)

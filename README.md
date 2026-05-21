@@ -190,14 +190,16 @@ uv run python training/adapter_contrastive_trainer.py
 
 **What it does:** Keeps speech content while training compression / optional rate controller and gate losses (`training/adapter_asr_trainer.py`).
 
-**CLI:**
+**CLI (two GPUs recommended for Qwen3-8B):** Whisper, adapter, and gate stay on GPU 0; frozen Qwen shards across all visible devices with `device_map="auto"` and a reserved memory cap on GPU 0 (`Stage2DeviceConfig` in `training/utils/config.py`).
 
 ```bash
 cd audio-streaming-adapter
-uv run python training/adapter_asr_trainer.py
+CUDA_VISIBLE_DEVICES=0,1 uv run python training/adapter_asr_trainer.py
 ```
 
-**Walkthrough:** `notebooks/training_stage2_asr.ipynb` — follow cells top-to-bottom; align hyperparameters with `Stage2Config`, `OptimConfig`, and constants at the top of `adapter_asr_trainer.py`.
+On a single GPU, omit `CUDA_VISIBLE_DEVICES` or set it to one index. If load still OOMs, raise `Stage2DeviceConfig.reserve_train_gpu_gib` (e.g. `18.0`) or lower `DataConfig.batch_size` in `adapter_asr_trainer.py`.
+
+**Walkthrough:** `notebooks/training_stage2_asr.ipynb` — follow cells top-to-bottom; align hyperparameters with `Stage2Config`, `Stage2DeviceConfig`, `OptimConfig`, and constants at the top of `adapter_asr_trainer.py`.
 
 ### Stage 3: Task distillation
 

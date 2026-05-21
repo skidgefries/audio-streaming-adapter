@@ -21,7 +21,7 @@ class LibriSpeechConfig:
             root=os.path.normpath(
                 os.path.join(
                     training_dir,
-                    "../../../datasets/librispeech_data/LibriSpeech/train-clean-100",
+                    "../datasets/librispeech_data/LibriSpeech/train-clean-100",
                 )
             )
         )

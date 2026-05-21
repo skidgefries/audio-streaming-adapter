@@ -39,9 +39,25 @@ class DataConfig:
 class Stage1Config:
     """Contrastive audio–text alignment."""
 
-    epochs: int = 5
+    epochs: int = 10
     lambda_stability: float = 0.1
+    # lambda_stability = 0.0
     temperature: float = 0.2
+
+
+@dataclass(frozen=True)
+class Stage2DeviceConfig:
+    """
+    Two-GPU layout for Stage 2 (``CUDA_VISIBLE_DEVICES=0,1``).
+
+    Whisper, StreamingAdapter, and EarlyCommitGate on GPU 0.
+    Frozen Qwen uses ``llm_device_map="auto"`` with balanced ``max_memory`` (~50/50 layers).
+    """
+
+    whisper_device: str = "cuda:0"
+    train_device: str = "cuda:1"
+    llm_device_map: str | dict | None = {"cuda:0": "2GB", "cuda:1": "12GB"}
+    reserve_train_gpu_gib: float = 3.0
 
 
 @dataclass(frozen=True)

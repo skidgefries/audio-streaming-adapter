@@ -11,6 +11,7 @@ import os
 import sys
 import torch
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
 
 _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _src_root = os.path.join(_pkg_root, "src")
@@ -19,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
 from src.adapter.streaming_adapter import StreamingAdapter
-from src.dataset import LibriSpeechConfig, LibriSpeechPairs, load_mono_waveform_16k
+from src.dataset import LibriSpeechConfig, load_mono_waveform_16k, LibriSpeechPairsCustom, LibriSpeechPairs
 from src.encoder import WhisperWindowFeatureExtractor
 from training.utils.checkpointing import TrainingCheckpoint, save_checkpoint
 from training.utils.config import CheckpointConfig, DataConfig, OptimConfig, Stage1Config, WandbConfig
@@ -39,21 +40,22 @@ LLM_MODEL_ID = "Qwen/Qwen3-8B"
 
 # Training hyperparameters
 STAGE = Stage1Config()
-OPT = OptimConfig(lr=1e-4, weight_decay=0.01, grad_clip_norm=0.5, warmup_steps=100)
+OPT = OptimConfig(lr=1e-4, weight_decay=0.01, grad_clip_norm=0.5, warmup_steps=1000)
+# OPT = OptimConfig(lr=1e-3, weight_decay=0.01, grad_clip_norm=1.0, warmup_steps=0)
 DATA = DataConfig(
     dataset_root=LibriSpeechConfig.default_train_clean_100_from_training_dir(os.path.dirname(__file__)).root,
-    batch_size=4,
+    batch_size=16,
     num_workers=2,
     max_windows_per_utt=None,
 )
 CKPT = CheckpointConfig(dir="checkpoints", save_every_epochs=1)
-WANDB = WandbConfig(enabled=False, project="audio-streaming-adapter", run_name="stage1-contrastive")
+WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="s1-centred")
 
-SAVE_PATH = os.path.join(CKPT.dir, "adapter_adapter.pt")
+SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage1.pt")
 
 
-# ── Loss Functions ─────────────────────────────────────────────────────────────
 
+# same dim1
 def _pad_tokens(utterances: list[torch.Tensor]) -> torch.Tensor:
     max_len = max(t.shape[1] for t in utterances)
     padded = []
@@ -88,31 +90,72 @@ def train():
         ema_alpha=0.8,
         learnable_ema=False,
         use_rate_controller=False,  # Fixed 4 tokens per window for stage 1
-    ).to(DEVICE, dtype=TORCH_DTYPE)
+    ).to(DEVICE, dtype= torch.bfloat16)
     adapter.train()
 
     print(f"StreamingAdapter initialized:")
     print(f"  Encoder dim: {WHISPER_DIM}")
     print(f"  LLM dim: {LLM_DIM}")
     print(f"  Max tokens/window: 4\n")
-
-    # Optimizer and scheduler
-    # optimizer = torch.optim.AdamW(adapter.parameters(), lr=LR, weight_decay=0.01)
-    optimizer = torch.optim.SGD(adapter.parameters(), lr=OPT.lr, weight_decay=OPT.weight_decay)
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.1,
-        total_iters=OPT.warmup_steps,
-    )
-
-    # Note: Losses computed in float32 for numerical stability, no mixed precision scaling needed
-
+    
     # Dataset and dataloader
     dataset = LibriSpeechPairs(DATA.dataset_root)
-    dataloader = DataLoader(dataset, batch_size=DATA.batch_size, shuffle=True, num_workers=DATA.num_workers)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=DATA.batch_size, 
+        shuffle=True, 
+        num_workers=DATA.num_workers
+    )
+ 
+#  check if the loss is working with a subset of the dataset   
+    # dataset = LibriSpeechPairsCustom(
+    #     dataset_root=DATA.dataset_root,
+    #     file_ids=[
+    #         "374-180299-0001",   #IN THE COURSE OF THE DAY I RECEIVED THIS note
+    #         "374-180299-0002",   #BE AT PRUDENCE'S TO NIGHT AT EIGHT
+    #         "7800-283478-0020",  #AS THE FOUR CHUMS WENT AWAY JERRY CHUCKLED
+    #         "7800-283492-0012",  #OH NO IT ISN'T SO BAD AS THAT HE WAS ASSURED
+    #         "7800-283493-0038",  #WELL SO LONG BOYS AND WE ALL WISH YOU SUCCESS
+    #         "3240-131232-0001",  #BUT MAY AFTER A WHILE BE SHAKEN DOWN BY STORMS
+    #         "1088-134315-0023",  #CLOSED THE DOOR CAREFULLY AND RETURNED TO THE HOUSE
+    #         "1088-134315-0055",  #IN THAT CASE WAS A NEW STEEL KEY
+    #     ]
+    # )
+    # dataloader = DataLoader(dataset, batch_size=DATA.batch_size, shuffle=False, num_workers=DATA.num_workers)
+
+    # Optimizer and scheduler
+    optimizer = torch.optim.AdamW(
+        adapter.parameters(), 
+        lr=OPT.lr, 
+        weight_decay=OPT.weight_decay
+    )
+    
+    # scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=OPT.warmup_steps)
+    
+    total_steps = STAGE.epochs * len(dataloader)
+
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=OPT.warmup_steps,
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - OPT.warmup_steps,
+        eta_min=1e-6,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[OPT.warmup_steps],
+    )
+    
+    # Note: Losses computed in float32 for numerical stability, no mixed precision scaling needed
 
     # Create checkpoint directory
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+
     logger = WandbLogger(
         enabled=WANDB.enabled,
         project=WANDB.project,
@@ -126,6 +169,30 @@ def train():
         },
     )
 
+    # ── Resume from checkpoint if available ───────────────────────────────────────
+    start_epoch = 0
+    if os.path.exists(SAVE_PATH):
+            print(f"Resuming from checkpoint: {SAVE_PATH}")
+            ckpt = torch.load(SAVE_PATH, map_location=DEVICE)
+            adapter.load_state_dict(ckpt["adapter_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            start_epoch = ckpt["epoch"]
+            global_step = ckpt["global_step"]
+            
+            # Fast-forward scheduler past warmup
+            for _ in range(global_step):
+                scheduler.step()
+                
+            # Force correct LR
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = OPT.lr
+            # scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            
+            print(f"  Resumed at epoch {start_epoch}, global_step {global_step}\n")
+    else:
+            global_step = 0
+        
+    
     print(f"Starting Stage 1 training: Audio-Text Alignment")
     print(f"  Epochs: {STAGE.epochs}")
     print(f"  Batch size: {DATA.batch_size}")
@@ -133,9 +200,7 @@ def train():
     print(f"  λ_stability: {STAGE.lambda_stability}")
     print(f"  Temperature: {STAGE.temperature}\n")
 
-    global_step = 0
-
-    for epoch in range(STAGE.epochs):
+    for epoch in range(start_epoch, STAGE.epochs):
         m_total = RunningMean()
         m_align = RunningMean()
         m_stab = RunningMean()
@@ -168,39 +233,41 @@ def train():
                 print(f"  shape: {label_embeds.shape}")
                 print(f"  min: {label_embeds.min()}, max: {label_embeds.max()}")
                 raise ValueError("label_embeds contains NaN")
+            
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                utterances = []
+                stab_sum = torch.zeros((), device=DEVICE, dtype=torch.float32)
+                for p in audio_paths:
+                    wave = load_mono_waveform_16k(p)
+                    windows = audio.waveform_to_windows(wave)
+                    if DATA.max_windows_per_utt is not None:
+                        windows = windows[: DATA.max_windows_per_utt]
+                    adapter.reset_streaming_state()
+                    chunks = []
+                    for w in windows:
+                        out = adapter.forward_window(w)
+                        chunks.append(out["tokens"])
+                        stab_sum = stab_sum + out["stability_loss"].float()
+                    utterances.append(torch.cat(chunks, dim=1))
 
-            utterances = []
-            stab_sum = torch.zeros((), device=DEVICE, dtype=torch.float32)
-            for p in audio_paths:
-                wave = load_mono_waveform_16k(p)
-                windows = audio.waveform_to_windows(wave)
-                if DATA.max_windows_per_utt is not None:
-                    windows = windows[: DATA.max_windows_per_utt]
-                adapter.reset_streaming_state()
-                chunks = []
-                for w in windows:
-                    out = adapter.forward_window(w)
-                    chunks.append(out["tokens"])
-                    stab_sum = stab_sum + out["stability_loss"].float()
-                utterances.append(torch.cat(chunks, dim=1))
-
-            audio_tokens = _pad_tokens(utterances)  # (B, T, D)
+                audio_tokens = _pad_tokens(utterances)  # (B, T, D)
 
             # Check for NaN in audio_tokens
-            if torch.isnan(audio_tokens).any():
-                print(f"[DEBUG] audio_tokens contains NaN at step {step}!")
-                print(f"  shape: {audio_tokens.shape}")
-                print(f"  min: {audio_tokens.min()}, max: {audio_tokens.max()}")
-                raise ValueError("audio_tokens contains NaN")
+                if torch.isnan(audio_tokens).any():
+                    print(f"[DEBUG] audio_tokens contains NaN at step {step}!")
+                    print(f"  shape: {audio_tokens.shape}")
+                    print(f"  min: {audio_tokens.min()}, max: {audio_tokens.max()}")
+                    raise ValueError("audio_tokens contains NaN")
 
             # Compute losses
             # Contrastive loss (already internally converts to float32)
-            align_loss = contrastive_infonce_loss(
-                audio_tokens=audio_tokens,
-                text_embeddings=label_embeds,
-                temperature=STAGE.temperature,
-            )
-            stability_loss = stab_sum / float(len(audio_paths))
+                align_loss, diag = contrastive_infonce_loss(
+                    audio_tokens=audio_tokens,
+                    text_embeddings=label_embeds,
+                    temperature=STAGE.temperature,
+                    return_diagnostics = True
+                )
+                stability_loss = stab_sum / float(len(audio_paths))
 
             if torch.isnan(stability_loss):
                 print(f"[DEBUG] stability_loss is NaN at step {step}!")
@@ -242,7 +309,12 @@ def train():
                     )
 
             torch.nn.utils.clip_grad_norm_(adapter.parameters(), OPT.grad_clip_norm)
+            
+            
+            optimizer.step()   # ← actually applies the gradients
+            scheduler.step()   # ← advances the LR warmup scheduler
 
+            # Check gradient norm   
             total_norm = 0.0
             for param in adapter.parameters():
                 if param.grad is not None:
@@ -266,12 +338,19 @@ def train():
                       f"Align: {align_loss.item():.4f} | "
                       f"Stab: {stability_loss.item():.4f} | "
                       f"LR: {current_lr:.2e}")
+                
                 logger.log(
                     {
                         "train/loss": total_loss.item(),
                         "train/align": align_loss.item(),
                         "train/stability": stability_loss.item(),
                         "train/lr": current_lr,
+                        "train/grad_norm": total_norm,
+                        "diag/pos_sim": diag["pos_sim"],       
+                        "diag/neg_sim": diag["neg_sim"],
+                        "diag/pos_minus_neg": diag["pos_minus_neg"],
+                        "diag/audio_std": diag["audio_std"],
+                        "diag/text_std": diag["text_std"], 
                     },
                     step=global_step,
                 )
@@ -285,8 +364,24 @@ def train():
         print(f"  Align Loss: {m_align.mean:.4f}")
         print(f"  Stability Loss: {m_stab.mean:.4f}\n")
 
+
+        EPOCH_SAVE_PATH = os.path.join(CKPT.dir, f"adapter_stage1_epoch{epoch+1}.pt")
+            
         save_checkpoint(
             SAVE_PATH,
+            TrainingCheckpoint(
+                stage=1,
+                epoch=epoch + 1,
+                global_step=global_step,
+                adapter_state_dict=adapter.state_dict(),
+                optimizer_state_dict=optimizer.state_dict(),
+                scheduler_state_dict=scheduler.state_dict(),
+                metrics={"loss": m_total.mean, "align": m_align.mean, "stability": m_stab.mean},
+            ),
+        )
+        
+        save_checkpoint(
+            EPOCH_SAVE_PATH,
             TrainingCheckpoint(
                 stage=1,
                 epoch=epoch + 1,

@@ -84,7 +84,7 @@ class StreamingAdapter(nn.Module):
         self.num_queries = num_queries
         self.use_rate_controller = use_rate_controller
         self.cross_layer_in_between = cross_layer_in_between
-
+        
         # Learnable query vectors Q ∈ R^{m × D_q}
         self.queries = nn.Parameter(torch.randn(1, num_queries, d_encoder) * 0.02)
 

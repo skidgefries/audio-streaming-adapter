@@ -127,6 +127,7 @@ def qwen_summarize_single_file(file_path: str) -> dict[str, str]:
 
         print(f"  ✓ Compressed to {num_tokens} tokens from {num_windows} windows")
         compression_ratio = (1500 * 768) / num_tokens if num_tokens > 0 else 0
+        overlap_percent = (WINDOW_SIZE_FRAMES - STRIDE_FRAMES) / WINDOW_SIZE_FRAMES * 100
         print(f"  ✓ Windowing: 0.2s window, 0.1s stride (50% overlap) over 30s chunk")
         print(f"  ✓ Compression ratio: {compression_ratio:.1f}x (1500 frames → {num_tokens} tokens)")
 
