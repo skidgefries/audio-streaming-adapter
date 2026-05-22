@@ -23,15 +23,31 @@ sys.path.insert(0, _src_root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
+from training.utils.env import env_str, load_project_env
+
+_env_path = load_project_env(_pkg_root)
+if _env_path:
+    print(f"Loaded environment from {_env_path}")
+
+_hf_token = env_str("HF_TOKEN")
+if _hf_token:
+    os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", _hf_token)
+
 from src.encoder import WhisperWindowFeatureExtractor
 from src.adapter.streaming_adapter import StreamingAdapter
 from src.adapter.early_commit_gate import EarlyCommitGate
 from src.dataset import LibriSpeechConfig, LibriSpeechPairs, load_mono_waveform_16k
 from src.llm import QwenConfig, load_qwen_models
-from training.utils.checkpointing import TrainingCheckpoint, load_adapter_state_dict, save_checkpoint
+from training.utils.checkpointing import (
+    TrainingCheckpoint,
+    load_adapter_state_dict,
+    maybe_upload_stage_epoch_checkpoint,
+    save_checkpoint,
+)
 from training.utils.config import (
     CheckpointConfig,
     DataConfig,
+    HfCheckpointConfig,
     OptimConfig,
     Stage3Config,
     Stage3DeviceConfig,
@@ -59,10 +75,11 @@ DATA = DataConfig(
     max_windows_per_utt=None,
 )
 CKPT = CheckpointConfig(dir="checkpoints")
+HF_CKPT = HfCheckpointConfig.from_env()
 WANDB = WandbConfig(enabled=False, project="audio-streaming-adapter", run_name="stage3-task")
 
-SAVE_PATH = os.path.join(CKPT.dir, "adapter_adapter.pt")
-adapter_PATH = os.path.join(CKPT.dir, "adapter_adapter.pt")
+SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage3.pt")
+adapter_PATH = os.path.join(CKPT.dir, "adapter_stage3.pt")
 
 TASK_TYPE = "asr"
 
@@ -371,6 +388,39 @@ def train() -> None:
                     "revision": m_rev.mean,
                 },
             ),
+        )
+
+        epoch_save_path = os.path.join(CKPT.dir, f"adapter_stage3_epoch{epoch + 1}.pt")
+        save_checkpoint(
+            epoch_save_path,
+            TrainingCheckpoint(
+                stage=3,
+                epoch=epoch + 1,
+                global_step=pipeline.global_step,
+                adapter_state_dict=adapter.state_dict(),
+                gate_state_dict=gate.state_dict(),
+                optimizer_state_dict=optimizer.state_dict(),
+                scheduler_state_dict=scheduler.state_dict(),
+                metrics={
+                    "loss": m_total.mean,
+                    "task": m_task.mean,
+                    "asr": m_asr.mean,
+                    "stability": m_stab.mean,
+                    "rate": m_rate.mean,
+                    "gate": m_gate.mean,
+                    "prefix": m_prefix.mean,
+                    "revision": m_rev.mean,
+                },
+            ),
+        )
+        maybe_upload_stage_epoch_checkpoint(
+            epoch_save_path,
+            stage=3,
+            repo_id=HF_CKPT.repo_id,
+            revision=HF_CKPT.revision,
+            private=HF_CKPT.private,
+            token=_hf_token,
+            enabled=HF_CKPT.upload_enabled,
         )
         print(f"\nEpoch {epoch + 1} done. Checkpoint -> {SAVE_PATH}\n")
 

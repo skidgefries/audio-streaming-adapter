@@ -8,18 +8,26 @@ Training-side utilities: **configs**, **checkpointing**, **losses**, **metrics**
 """
 
 from training.utils.audio import WhisperWindowFeatureExtractor
-from training.utils.checkpointing import TrainingCheckpoint, load_adapter_state_dict, save_checkpoint
+from training.utils.checkpointing import (
+    TrainingCheckpoint,
+    load_adapter_state_dict,
+    maybe_upload_stage_epoch_checkpoint,
+    save_checkpoint,
+)
 from training.utils.common import AdapterCheckpoint, default_librispeech_root_from_training_dir
 from training.utils.common import save_checkpoint as save_legacy_adapter_checkpoint
 from training.utils.config import (
     CheckpointConfig,
     DataConfig,
     FrozenModelIdsConfig,
+    HfCheckpointConfig,
     OptimConfig,
     Stage1Config,
     Stage2Config,
+    DeviceConfig,
     Stage3Config,
     Stage3DeviceConfig,
+    TrainingLaunchConfig,
     StreamingAdapterTrainConfig,
     TuningConfig,
     WandbConfig,
@@ -53,11 +61,14 @@ __all__ = [
     "CheckpointConfig",
     "DataConfig",
     "FrozenModelIdsConfig",
+    "HfCheckpointConfig",
     "OptimConfig",
     "RunningMean",
     "Stage1Config",
     "Stage2Config",
+    "DeviceConfig",
     "Stage3Config",
+    "TrainingLaunchConfig",
     "Stage3DeviceConfig",
     "StreamingAdapterTrainConfig",
     "TrainingCheckpoint",
@@ -75,6 +86,7 @@ __all__ = [
     "default_librispeech_root_from_training_dir",
     "kl_distill_loss",
     "load_adapter_state_dict",
+    "maybe_upload_stage_epoch_checkpoint",
     "load_frozen_qwen_causal_lm",
     "load_frozen_qwen_embeddings",
     "load_frozen_whisper",

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+
+from training.utils.env import env_bool, env_float, env_int, env_optional_int, env_str
 
 
 @dataclass(frozen=True)
@@ -11,12 +14,55 @@ class WandbConfig:
     run_name: str | None = None
     tags: list[str] | None = None
 
+    @classmethod
+    def from_env(cls) -> WandbConfig:
+        entity = env_str("WANDB_ENTITY")
+        run_name = env_str("WANDB_RUN_NAME")
+        return cls(
+            enabled=env_bool("WANDB_ENABLED", default=False),
+            project=env_str("WANDB_PROJECT", "audio-streaming-adapter") or "audio-streaming-adapter",
+            entity=entity,
+            run_name=run_name,
+            tags=None,
+        )
+
 
 @dataclass(frozen=True)
 class CheckpointConfig:
     dir: str = "checkpoints"
     save_every_steps: int | None = None
     save_every_epochs: int = 1
+
+    @classmethod
+    def from_env(cls, *, pkg_root: str | None = None) -> CheckpointConfig:
+        ckpt_dir = env_str("CHECKPOINT_DIR", "checkpoints") or "checkpoints"
+        if pkg_root and not os.path.isabs(ckpt_dir):
+            ckpt_dir = os.path.join(pkg_root, ckpt_dir)
+        return cls(
+            dir=ckpt_dir,
+            save_every_steps=env_optional_int("CHECKPOINT_SAVE_EVERY_STEPS"),
+            save_every_epochs=env_int("CHECKPOINT_SAVE_EVERY_EPOCHS", 1),
+        )
+
+
+@dataclass(frozen=True)
+class HfCheckpointConfig:
+    """Upload epoch checkpoints for the active training stage only (other repo files unchanged)."""
+
+    repo_id: str = "vaghawan/audio-streaming-adapter-checkpoints"
+    upload_enabled: bool = False
+    private: bool = False
+    revision: str = "main"
+
+    @classmethod
+    def from_env(cls) -> HfCheckpointConfig:
+        return cls(
+            repo_id=env_str("HF_CHECKPOINT_REPO", "vaghawan/audio-streaming-adapter-checkpoints")
+            or "vaghawan/audio-streaming-adapter-checkpoints",
+            upload_enabled=env_bool("HF_UPLOAD_CHECKPOINTS", False),
+            private=env_bool("HF_CHECKPOINT_PRIVATE", False),
+            revision=env_str("HF_CHECKPOINT_REVISION", "main") or "main",
+        )
 
 
 @dataclass(frozen=True)
@@ -26,6 +72,15 @@ class OptimConfig:
     grad_clip_norm: float = 1.0
     warmup_steps: int = 0
 
+    @classmethod
+    def from_env(cls) -> OptimConfig:
+        return cls(
+            lr=env_float("LEARNING_RATE", 5e-5),
+            weight_decay=env_float("WEIGHT_DECAY", 0.01),
+            grad_clip_norm=env_float("GRAD_CLIP_NORM", 1.0),
+            warmup_steps=env_int("WARMUP_STEPS", 500),
+        )
+
 
 @dataclass(frozen=True)
 class DataConfig:
@@ -33,6 +88,17 @@ class DataConfig:
     batch_size: int
     num_workers: int = 2
     max_windows_per_utt: int | None = None
+
+    @classmethod
+    def from_env(cls, *, default_dataset_root: str) -> DataConfig:
+        root = env_str("DATASET_ROOT") or default_dataset_root
+        max_win = env_str("MAX_WINDOWS_PER_UTT")
+        return cls(
+            dataset_root=root,
+            batch_size=env_int("BATCH_SIZE", 8),
+            num_workers=env_int("NUM_WORKERS", 2),
+            max_windows_per_utt=int(max_win) if max_win else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -46,18 +112,14 @@ class Stage1Config:
 
 
 @dataclass(frozen=True)
-class Stage2DeviceConfig:
-    """
-    Two-GPU layout for Stage 2 (``CUDA_VISIBLE_DEVICES=0,1``).
+class DeviceConfig:
+    """Primary compute device. Set ``DEVICE=cpu`` to force CPU; default is CUDA when available."""
 
-    Whisper, StreamingAdapter, and EarlyCommitGate on GPU 0.
-    Frozen Qwen uses ``llm_device_map="auto"`` with balanced ``max_memory`` (~50/50 layers).
-    """
+    device: str = "cuda"
 
-    whisper_device: str = "cuda:0"
-    train_device: str = "cuda:1"
-    llm_device_map: str | dict | None = {"cuda:0": "2GB", "cuda:1": "12GB"}
-    reserve_train_gpu_gib: float = 3.0
+    @classmethod
+    def from_env(cls) -> DeviceConfig:
+        return cls(device=env_str("DEVICE", "cuda") or "cuda")
 
 
 @dataclass(frozen=True)
@@ -73,6 +135,60 @@ class Stage2Config:
 
     use_rate_controller: bool = True
     rate_target: float = 2.0
+    max_text_tokens: int = 128
+    asr_micro_batch_size: int = 1
+    enable_llm_gradient_checkpointing: bool = False
+
+    @classmethod
+    def from_env(cls) -> Stage2Config:
+        return cls(
+            epochs=env_int("EPOCHS", 10),
+            lambda_align=env_float("LAMBDA_ALIGN", 0.1),
+            lambda_stability=env_float("LAMBDA_STABILITY", 0.05),
+            lambda_rate=env_float("LAMBDA_RATE", 0.001),
+            lambda_gate=env_float("LAMBDA_GATE", 0.1),
+            temperature=env_float("TEMPERATURE", 0.07),
+            use_rate_controller=env_bool("USE_RATE_CONTROLLER", True),
+            rate_target=env_float("RATE_TARGET", 2.0),
+            max_text_tokens=env_int("MAX_TEXT_TOKENS", 128),
+            asr_micro_batch_size=env_int("ASR_MICRO_BATCH_SIZE", 8),
+            enable_llm_gradient_checkpointing=env_bool(
+                "ENABLE_LLM_GRADIENT_CHECKPOINTING", False
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class TrainingLaunchConfig:
+    """
+    How Stage 2 is launched from ``setup_remote_training.sh``.
+
+    One visible GPU → ``uv run``; two or more → ``torchrun``.
+
+    Stage 2 keeps ``nproc_per_node=1`` so a single process can shard the frozen LLM
+    across all visible GPUs via HuggingFace ``device_map="auto"``. Override
+    ``TORCHRUN_NPROC_PER_NODE`` only for custom distributed training.
+    """
+
+    use_torchrun: str = "auto"  # auto | true | false | 1 | 0
+    torchrun_nproc_per_node: int = 1
+    torchrun_master_port: int = 29500
+
+    @classmethod
+    def from_env(cls) -> TrainingLaunchConfig:
+        return cls(
+            use_torchrun=env_str("USE_TORCHRUN", "auto") or "auto",
+            torchrun_nproc_per_node=env_int("TORCHRUN_NPROC_PER_NODE", 1),
+            torchrun_master_port=env_int("TORCHRUN_MASTER_PORT", 29500),
+        )
+
+    def should_use_torchrun(self, visible_gpus: int) -> bool:
+        mode = self.use_torchrun.strip().lower()
+        if mode in ("1", "true", "yes", "on"):
+            return True
+        if mode in ("0", "false", "no", "off"):
+            return False
+        return visible_gpus >= 2
 
 
 @dataclass(frozen=True)
@@ -123,6 +239,14 @@ class FrozenModelIdsConfig:
     whisper_model_id: str = "openai/whisper-small"
     llm_model_id: str = "Qwen/Qwen3-8B"
 
+    @classmethod
+    def from_env(cls) -> FrozenModelIdsConfig:
+        return cls(
+            whisper_model_id=env_str("WHISPER_MODEL_ID", "openai/whisper-small")
+            or "openai/whisper-small",
+            llm_model_id=env_str("LLM_MODEL_ID", "Qwen/Qwen3-8B") or "Qwen/Qwen3-8B",
+        )
+
 
 @dataclass(frozen=True)
 class StreamingAdapterTrainConfig:
@@ -148,7 +272,7 @@ class TuningConfig:
     """Optional sweep-friendly bundle (subset of knobs often tuned together)."""
 
     lr: float = 3e-5
-    batch_size: int = 1
+    batch_size: int = 16
     grad_clip_norm: float = 1.0
     whisper_windowing: WhisperWaveformWindowingConfig = field(
         default_factory=WhisperWaveformWindowingConfig

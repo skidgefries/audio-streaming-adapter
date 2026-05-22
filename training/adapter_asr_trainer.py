@@ -1,18 +1,18 @@
 """
 Stage 2: ASR distillation — frozen Whisper + frozen Qwen, train StreamingAdapter + EarlyCommitGate.
 
-Shared building blocks live in `training.*` and `dataset.*`.
+Configuration is loaded from ``.env`` in the package root (see ``.env.example``).
 
-Inference that mirrors this loop (per-window adapter + ``L_gate`` / EarlyCommitGate) should use
-:class:`adapter_llm_pipeline.WhisperAdapterLLMCommitGatePipeline`, not
-:class:`adapter_llm_pipeline.WhisperAdapterLLMPipeline`.
+**Single GPU**::
 
-Two-GPU layout (recommended for Qwen3-8B)::
+    uv run training/adapter_asr_trainer.py
 
-    CUDA_VISIBLE_DEVICES=0,1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
-        uv run training/adapter_asr_trainer.py
+**Multi-GPU** (frozen Qwen sharded automatically via ``device_map="auto"``)::
 
-Whisper, adapter, and gate on GPU 0; frozen Qwen sharded ~50/50 on both GPUs.
+    uv run torchrun --standalone --nnodes=1 --nproc_per_node=1 training/adapter_asr_trainer.py
+
+Or use ``bash scripts/setup_remote_training.sh``, which sources ``.env``, checks PyTorch
+CUDA compatibility, downloads data/checkpoints, and picks ``uv run`` vs ``torchrun``.
 """
 
 from __future__ import annotations
@@ -21,33 +21,60 @@ import os
 import sys
 from contextlib import nullcontext
 
-import torch
-from torch.utils.data import DataLoader
-
 _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _src_root = os.path.join(_pkg_root, "src")
 sys.path.insert(0, _src_root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
+from training.utils.env import env_str, load_project_env
+
+_env_path = load_project_env(_pkg_root)
+if _env_path:
+    print(f"Loaded environment from {_env_path}")
+
+_hf_token = env_str("HF_TOKEN")
+if _hf_token:
+    os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", _hf_token)
+
+from training.utils.devices import apply_runtime_cuda_env
+
+apply_runtime_cuda_env()
+
+if env_str("CHECK_TORCH_COMPAT", "0") in ("1", "true", "yes", "on"):
+    from training.utils.torch_compat import ensure_torch_compatible
+
+    ensure_torch_compatible()
+
+import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
 from src.adapter.streaming_adapter import StreamingAdapter
 from src.adapter.early_commit_gate import EarlyCommitGate
 from src.dataset import LibriSpeechConfig, LibriSpeechPairs, load_mono_waveform_16k
 from src.encoder import WhisperWindowFeatureExtractor
-from training.utils.checkpointing import TrainingCheckpoint, save_checkpoint
+from training.utils.checkpointing import (
+    TrainingCheckpoint,
+    maybe_upload_stage_epoch_checkpoint,
+    save_checkpoint,
+)
 from training.utils.config import (
     CheckpointConfig,
     DataConfig,
+    DeviceConfig,
+    FrozenModelIdsConfig,
+    HfCheckpointConfig,
     OptimConfig,
     Stage2Config,
-    Stage2DeviceConfig,
     WandbConfig,
 )
 from training.utils.devices import (
-    default_train_device,
-    init_cuda_for_device_map,
+    cleanup_distributed,
+    init_training_context,
+    llm_device_map,
     llm_input_device,
-    qwen_balanced_max_memory,
 )
 from training.utils.logging import WandbLogger
 from training.utils.losses import contrastive_infonce_loss
@@ -57,81 +84,125 @@ from training.utils.optimization import TrainingPipeline
 
 _, TORCH_DTYPE = default_device_and_dtype()
 
+MODEL_IDS = FrozenModelIdsConfig.from_env()
 WHISPER_DIM = 768
 LLM_DIM = 4096
-WHISPER_MODEL = "openai/whisper-small"
-LLM_MODEL_ID = "Qwen/Qwen3-8B"
+WHISPER_MODEL = MODEL_IDS.whisper_model_id
+LLM_MODEL_ID = MODEL_IDS.llm_model_id
 
-STAGE = Stage2Config()
-DEV = Stage2DeviceConfig()
-OPT = OptimConfig(lr=5e-5, weight_decay=0.01, grad_clip_norm=1.0, warmup_steps=1000)
-DATA = DataConfig(
-    dataset_root=LibriSpeechConfig.default_train_clean_100_from_training_dir(os.path.dirname(__file__)).root,
-    batch_size=2,
-    num_workers=2,
-    max_windows_per_utt=None,
+STAGE = Stage2Config.from_env()
+DEVICE_CFG = DeviceConfig.from_env()
+OPT = OptimConfig.from_env()
+DATA = DataConfig.from_env(
+    default_dataset_root=LibriSpeechConfig.default_train_clean_100_from_training_dir(
+        os.path.dirname(__file__)
+    ).root,
 )
-CKPT = CheckpointConfig(dir="checkpoints", save_every_epochs=1)
-WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="stage2-asr")
+CKPT = CheckpointConfig.from_env(pkg_root=_pkg_root)
+HF_CKPT = HfCheckpointConfig.from_env()
+WANDB = WandbConfig.from_env()
 
 SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage2.pt")
-STAGE1_SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage1.pt")
+_stage1_rel = env_str("STAGE1_CHECKPOINT", "checkpoints/adapter_stage1.pt") or "checkpoints/adapter_stage1.pt"
+STAGE1_SAVE_PATH = (
+    _stage1_rel if os.path.isabs(_stage1_rel) else os.path.join(_pkg_root, _stage1_rel)
+)
 
 USE_RATE_CONTROLLER = STAGE.use_rate_controller
 RATE_TARGET = STAGE.rate_target
 
 
-def _maybe_autocast():
-    if torch.cuda.is_available():
+def _maybe_autocast(device: torch.device):
+    if device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
 
 
-def _stage2_devices(num_gpus: int) -> tuple[str, str, str | dict | None, dict[int, str] | None]:
-    """Whisper/adapter device and Qwen ``device_map`` / ``max_memory`` for the GPU count."""
-    if not torch.cuda.is_available():
-        cpu = default_train_device()
-        return cpu, cpu, None, None
-    train_device = DEV.train_device
-    whisper_device = DEV.whisper_device
-    if num_gpus >= 2:
-        llm_device_map: str | dict | None = DEV.llm_device_map or "auto"
-        llm_max_memory = qwen_balanced_max_memory(reserve_on_gpu0_gib=DEV.reserve_train_gpu_gib)
-    else:
-        whisper_device = train_device
-        llm_device_map = None
-        llm_max_memory = None
-    return whisper_device, train_device, llm_device_map, llm_max_memory
+def _enable_llm_gradient_checkpointing(llm_model: torch.nn.Module) -> None:
+    if not STAGE.enable_llm_gradient_checkpointing:
+        return
+    if hasattr(llm_model, "gradient_checkpointing_enable"):
+        llm_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+    if hasattr(llm_model, "enable_input_require_grads"):
+        llm_model.enable_input_require_grads()
+
+
+def _asr_forward_loss(
+    llm_model: torch.nn.Module,
+    *,
+    inputs_embeds: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor,
+    micro_batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Run frozen LM loss; micro-batch to cap activation memory."""
+    n = inputs_embeds.shape[0]
+    chunk = max(1, min(micro_batch_size, n))
+    if chunk >= n:
+        with _maybe_autocast(device):
+            return llm_model(
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                attention_mask=attention_mask,
+            ).loss
+
+    losses: list[torch.Tensor] = []
+    for start in range(0, n, chunk):
+        end = start + chunk
+        with _maybe_autocast(device):
+            out = llm_model(
+                inputs_embeds=inputs_embeds[start:end],
+                labels=labels[start:end],
+                attention_mask=attention_mask[start:end],
+            )
+        losses.append(out.loss)
+    return torch.stack(losses).mean()
+
+
+def _unwrap(module: torch.nn.Module) -> torch.nn.Module:
+    return module.module if isinstance(module, DDP) else module
 
 
 def train() -> None:
-    num_gpus = init_cuda_for_device_map()
-    whisper_device, train_device, llm_device_map, llm_max_memory = _stage2_devices(num_gpus)
+    ctx = init_training_context()
+    train_device = ctx.device
+    train_device_str = str(train_device)
 
-    torch.cuda.empty_cache()
-    print(f"Visible CUDA devices: {num_gpus}")
-    print(f"Whisper device: {whisper_device}")
-    print(f"Train device (adapter / gate): {train_device}")
-    print(f"Qwen device_map: {llm_device_map!r}")
-    if llm_max_memory is not None:
-        print(f"Qwen max_memory (balanced ~50/50): {llm_max_memory}")
+    if ctx.is_main:
+        print(f"Training device: {train_device_str} (configured: {DEVICE_CFG.device})")
+        print(f"Visible CUDA devices: {ctx.num_cuda_devices}")
+        print(f"Distributed: world_size={ctx.world_size} rank={ctx.rank}")
+        print(f"Model parallel (LLM auto-shard): {ctx.model_parallel}")
 
     audio = WhisperWindowFeatureExtractor(
-        model_id=WHISPER_MODEL, device=whisper_device, torch_dtype=TORCH_DTYPE
+        model_id=WHISPER_MODEL, device=train_device_str, torch_dtype=TORCH_DTYPE
     )
+
+    qwen_map = llm_device_map(ctx)
+    if ctx.is_main:
+        print(f"Qwen device_map: {qwen_map!r}")
 
     qwen_models = load_frozen_qwen_causal_lm(
         model_id=LLM_MODEL_ID,
-        device=train_device,
+        device=train_device_str,
         torch_dtype=TORCH_DTYPE,
-        device_map=llm_device_map,
-        max_memory=llm_max_memory,
+        device_map=qwen_map,
     )
     llm_tokenizer = qwen_models.tokenizer
     llm_model = qwen_models.causal_lm
     text_embedder = qwen_models.embedder
     llm_device = llm_input_device(llm_model)
-    print(f"Qwen input embeddings device: {llm_device}")
+    _enable_llm_gradient_checkpointing(llm_model)
+    llm_model.train()
+    for p in llm_model.parameters():
+        p.requires_grad = False
+    if ctx.is_main:
+        print(f"Qwen input embeddings device: {llm_device}")
+        if STAGE.enable_llm_gradient_checkpointing:
+            print("Qwen gradient checkpointing: enabled")
 
     adapter = StreamingAdapter(
         d_encoder=WHISPER_DIM,
@@ -151,7 +222,11 @@ def train() -> None:
 
     stage1_ckpt = torch.load(STAGE1_SAVE_PATH, map_location=train_device)
     adapter.load_state_dict(stage1_ckpt["adapter_state_dict"], strict=False)
-    print(f"Loaded Stage 1 adapter weights from {STAGE1_SAVE_PATH} (epoch {stage1_ckpt.get('epoch', '?')})")
+    if ctx.is_main:
+        print(
+            f"Loaded Stage 1 adapter weights from {STAGE1_SAVE_PATH} "
+            f"(epoch {stage1_ckpt.get('epoch', '?')})"
+        )
 
     gate = EarlyCommitGate(
         d_llm=LLM_DIM,
@@ -161,11 +236,17 @@ def train() -> None:
     ).to(train_device, dtype=TORCH_DTYPE)
     gate.train()
 
-    print(
-        f"Models initialized:\n  Adapter: trainable\n  Early-commit gate: trainable\n  Rate controller: {USE_RATE_CONTROLLER}\n"
-    )
+    if ctx.world_size > 1:
+        adapter = DDP(adapter, device_ids=[ctx.local_rank])
+        gate = DDP(gate, device_ids=[ctx.local_rank])
 
-    trainable_params = list(adapter.parameters()) + list(gate.parameters())
+    if ctx.is_main:
+        print(
+            f"Models initialized:\n  Adapter: trainable\n  Early-commit gate: trainable\n"
+            f"  Rate controller: {USE_RATE_CONTROLLER}\n"
+        )
+
+    trainable_params = list(_unwrap(adapter).parameters()) + list(_unwrap(gate).parameters())
     optimizer = torch.optim.AdamW(trainable_params, lr=OPT.lr, weight_decay=OPT.weight_decay)
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
@@ -175,11 +256,21 @@ def train() -> None:
     pipeline = TrainingPipeline(optimizer=optimizer, scheduler=scheduler, grad_clip_norm=OPT.grad_clip_norm)
 
     dataset = LibriSpeechPairs(DATA.dataset_root)
-    dataloader = DataLoader(dataset, batch_size=DATA.batch_size, shuffle=True, num_workers=DATA.num_workers)
+    sampler: DistributedSampler | None = None
+    if ctx.world_size > 1:
+        sampler = DistributedSampler(dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=DATA.batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=DATA.num_workers,
+    )
 
-    os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
+    if ctx.is_main:
+        os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
     logger = WandbLogger(
-        enabled=WANDB.enabled,
+        enabled=WANDB.enabled and ctx.is_main,
         project=WANDB.project,
         entity=WANDB.entity,
         run_name=WANDB.run_name,
@@ -188,17 +279,19 @@ def train() -> None:
             "data": DATA.__dict__,
             "optim": OPT.__dict__,
             "stage_cfg": STAGE.__dict__,
-            "device_cfg": DEV.__dict__,
-            "num_gpus": num_gpus,
+            "device": DEVICE_CFG.__dict__,
+            "num_cuda_devices": ctx.num_cuda_devices,
+            "model_parallel": ctx.model_parallel,
+            "world_size": ctx.world_size,
         },
     )
 
     start_epoch = 0
-    if os.path.exists(SAVE_PATH):
+    if ctx.is_main and os.path.exists(SAVE_PATH):
         print(f"Resuming from checkpoint: {SAVE_PATH}")
         ckpt = torch.load(SAVE_PATH, map_location=train_device)
-        adapter.load_state_dict(ckpt["adapter_state_dict"])
-        gate.load_state_dict(ckpt["gate_state_dict"])
+        _unwrap(adapter).load_state_dict(ckpt["adapter_state_dict"])
+        _unwrap(gate).load_state_dict(ckpt["gate_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt["epoch"]
         pipeline.global_step = ckpt["global_step"]
@@ -208,17 +301,24 @@ def train() -> None:
     else:
         start_epoch = 0
 
-    print("\nStarting Stage 2 training: ASR Distillation")
-    print(f"  Epochs: {STAGE.epochs}")
-    print(f"  Batch size: {DATA.batch_size}")
-    print(f"  Learning rate: {OPT.lr}")
-    print(f"  λ_align: {STAGE.lambda_align}")
-    print(f"  λ_stability: {STAGE.lambda_stability}")
-    print(f"  λ_rate: {STAGE.lambda_rate}")
-    print(f"  λ_gate: {STAGE.lambda_gate}")
-    print(f"  Rate target: {RATE_TARGET} tokens/window\n")
+    if ctx.is_main:
+        print("\nStarting Stage 2 training: ASR Distillation")
+        print(f"  Epochs: {STAGE.epochs}")
+        print(f"  Batch size: {DATA.batch_size}")
+        print(f"  Learning rate: {OPT.lr}")
+        print(f"  λ_align: {STAGE.lambda_align}")
+        print(f"  λ_stability: {STAGE.lambda_stability}")
+        print(f"  λ_rate: {STAGE.lambda_rate}")
+        print(f"  λ_gate: {STAGE.lambda_gate}")
+        print(f"  Rate target: {RATE_TARGET} tokens/window")
+        print(f"  Max windows/utt: {DATA.max_windows_per_utt}")
+        print(f"  Max text tokens: {STAGE.max_text_tokens}")
+        print(f"  ASR micro-batch: {STAGE.asr_micro_batch_size}\n")
 
     for epoch in range(start_epoch, STAGE.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
         m_total = RunningMean()
         m_asr = RunningMean()
         m_align = RunningMean()
@@ -227,7 +327,8 @@ def train() -> None:
         m_rate = RunningMean()
         m_gate = RunningMean()
 
-        print(f"\n{'=' * 60}\nEpoch {epoch + 1}/{STAGE.epochs}\n{'=' * 60}\n")
+        if ctx.is_main:
+            print(f"\n{'=' * 60}\nEpoch {epoch + 1}/{STAGE.epochs}\n{'=' * 60}\n")
 
         for step, batch in enumerate(dataloader):
             audio_paths, transcriptions = batch
@@ -238,7 +339,7 @@ def train() -> None:
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=256,
+                max_length=STAGE.max_text_tokens,
             ).to(train_device)
             gt_ids = gt_tokens.input_ids
             gt_attention_mask = gt_tokens.attention_mask
@@ -254,16 +355,21 @@ def train() -> None:
             total_rate_loss = torch.zeros((), device=train_device, dtype=torch.float32)
             total_gate_loss = torch.zeros((), device=train_device, dtype=torch.float32)
 
+            adapter_module = _unwrap(adapter)
+            gate_module = _unwrap(gate)
+
             for p in audio_paths:
                 wave = load_mono_waveform_16k(p)
                 windows = audio.waveform_to_windows(wave)
                 if DATA.max_windows_per_utt is not None:
                     windows = windows[: DATA.max_windows_per_utt]
 
-                adapter.reset_streaming_state()
+                adapter_module.reset_streaming_state()
                 utterance_tokens: list[torch.Tensor] = []
                 for t, window in enumerate(windows):
-                    result = adapter.forward_window(window)
+                    result = adapter_module.forward_window(
+                        window.to(device=train_device, dtype=TORCH_DTYPE)
+                    )
                     utterance_tokens.append(result["tokens"])
                     total_stability_loss = total_stability_loss + result["stability_loss"].float()
                     if result["sparse_loss"] is not None:
@@ -272,7 +378,7 @@ def train() -> None:
                         total_rate_loss = total_rate_loss + result["rate_loss"].float()
                     if t > 0:
                         accumulated = torch.cat(utterance_tokens[:t], dim=1)
-                        gate_result = gate(accumulated, t, len(windows))
+                        gate_result = gate_module(accumulated, t, len(windows))
                         total_gate_loss = total_gate_loss + gate_result["gate_loss"].float()
                         gate_calls += 1
 
@@ -282,7 +388,8 @@ def train() -> None:
                     num_windows_list.append(len(windows))
 
             if not audio_tokens_list:
-                print(f"[WARN] Step {step}: empty batch (no audio windows); skipping.")
+                if ctx.is_main:
+                    print(f"[WARN] Step {step}: empty batch (no audio windows); skipping.")
                 continue
 
             max_tokens = max(t.shape[1] for t in audio_tokens_list)
@@ -320,13 +427,14 @@ def train() -> None:
             pre_text_mask = torch.ones((batch_size, audio_len + 1), device=llm_device)
             llm_attention_mask = torch.cat([pre_text_mask, gt_attention_mask[:, 1:].to(llm_device)], dim=1)
 
-            with _maybe_autocast():
-                asr_output = llm_model(
-                    inputs_embeds=inputs_embeds,
-                    labels=labels,
-                    attention_mask=llm_attention_mask,
-                )
-                asr_loss = asr_output.loss
+            asr_loss = _asr_forward_loss(
+                llm_model,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                attention_mask=llm_attention_mask,
+                micro_batch_size=STAGE.asr_micro_batch_size,
+                device=train_device,
+            )
 
             align_loss = contrastive_infonce_loss(
                 audio_tokens=audio_tokens.float(),
@@ -372,13 +480,13 @@ def train() -> None:
             m_rate.update(rate_loss.item())
             m_gate.update(float(gate_loss_mean.item()))
 
-            if step % 10 == 0:
+            if ctx.is_main and step % 1 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 print(
                     f"Step {step:4d}/{len(dataloader)} | Loss: {total_loss.item():.4f} | "
                     f"ASR: {asr_loss.item():.4f} | Align: {align_loss.item():.4f} | "
-                    f"Stab: {float(stability_loss):.4f} | "
-                    f"Rate: {rate_loss.item():.4f} | Gate: {float(gate_loss_mean):.4f} | "
+                    f"Stab: {stability_loss.float().item():.4f} | "
+                    f"Rate: {rate_loss.item():.4f} | Gate: {gate_loss_mean.float().item():.4f} | "
                     f"Sparse(metric): {sparse_loss.item():.4f} | LR: {current_lr:.2e}"
                 )
                 logger.log(
@@ -386,71 +494,82 @@ def train() -> None:
                         "train/loss": total_loss.item(),
                         "train/asr": asr_loss.item(),
                         "train/align": align_loss.item(),
-                        "train/stability": float(stability_loss),
+                        "train/stability": stability_loss.float().item(),
                         "train/rate": rate_loss.item(),
-                        "train/gate": float(gate_loss_mean),
+                        "train/gate": gate_loss_mean.float().item(),
                         "train/sparse_metric": sparse_loss.item(),
                         "train/lr": current_lr,
                     },
                     step=pipeline.global_step,
                 )
 
-            if train_device.startswith("cuda"):
+            if train_device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        save_checkpoint(
-            SAVE_PATH,
-            TrainingCheckpoint(
+        if ctx.is_main:
+            save_checkpoint(
+                SAVE_PATH,
+                TrainingCheckpoint(
+                    stage=2,
+                    epoch=epoch + 1,
+                    global_step=pipeline.global_step,
+                    adapter_state_dict=_unwrap(adapter).state_dict(),
+                    gate_state_dict=_unwrap(gate).state_dict(),
+                    optimizer_state_dict=optimizer.state_dict(),
+                    scheduler_state_dict=scheduler.state_dict(),
+                    metrics={
+                        "loss": m_total.mean,
+                        "asr": m_asr.mean,
+                        "align": m_align.mean,
+                        "stability": m_stab.mean,
+                        "sparse": m_sparse.mean,
+                        "rate": m_rate.mean,
+                        "gate": m_gate.mean,
+                    },
+                ),
+            )
+
+            epoch_save_path = os.path.join(CKPT.dir, f"adapter_stage2_epoch{epoch + 1}.pt")
+            save_checkpoint(
+                epoch_save_path,
+                TrainingCheckpoint(
+                    stage=2,
+                    epoch=epoch + 1,
+                    global_step=pipeline.global_step,
+                    adapter_state_dict=_unwrap(adapter).state_dict(),
+                    gate_state_dict=_unwrap(gate).state_dict(),
+                    optimizer_state_dict=optimizer.state_dict(),
+                    scheduler_state_dict=scheduler.state_dict(),
+                    metrics={
+                        "loss": m_total.mean,
+                        "asr": m_asr.mean,
+                        "align": m_align.mean,
+                        "stability": m_stab.mean,
+                        "sparse": m_sparse.mean,
+                        "rate": m_rate.mean,
+                        "gate": m_gate.mean,
+                    },
+                ),
+            )
+            maybe_upload_stage_epoch_checkpoint(
+                epoch_save_path,
                 stage=2,
-                epoch=epoch + 1,
-                global_step=pipeline.global_step,
-                adapter_state_dict=adapter.state_dict(),
-                gate_state_dict=gate.state_dict(),
-                optimizer_state_dict=optimizer.state_dict(),
-                scheduler_state_dict=scheduler.state_dict(),
-                metrics={
-                    "loss": m_total.mean,
-                    "asr": m_asr.mean,
-                    "align": m_align.mean,
-                    "stability": m_stab.mean,
-                    "sparse": m_sparse.mean,
-                    "rate": m_rate.mean,
-                    "gate": m_gate.mean,
-                },
-            ),
-        )
+                repo_id=HF_CKPT.repo_id,
+                revision=HF_CKPT.revision,
+                private=HF_CKPT.private,
+                token=_hf_token,
+                enabled=HF_CKPT.upload_enabled,
+            )
 
-        epoch_save_path = os.path.join(CKPT.dir, f"adapter_stage2_epoch{epoch + 1}.pt")
+            print(
+                f"\nEpoch {epoch + 1} complete: loss={m_total.mean:.4f} asr={m_asr.mean:.4f} "
+                f"align={m_align.mean:.4f} stab={m_stab.mean:.4f}\nCheckpoint -> {SAVE_PATH}\n"
+            )
 
-        save_checkpoint(
-            epoch_save_path,
-            TrainingCheckpoint(
-                stage=2,
-                epoch=epoch + 1,
-                global_step=pipeline.global_step,
-                adapter_state_dict=adapter.state_dict(),
-                gate_state_dict=gate.state_dict(),
-                optimizer_state_dict=optimizer.state_dict(),
-                scheduler_state_dict=scheduler.state_dict(),
-                metrics={
-                    "loss": m_total.mean,
-                    "asr": m_asr.mean,
-                    "align": m_align.mean,
-                    "stability": m_stab.mean,
-                    "sparse": m_sparse.mean,
-                    "rate": m_rate.mean,
-                    "gate": m_gate.mean,
-                },
-            ),
-        )
-
-        print(
-            f"\nEpoch {epoch + 1} complete: loss={m_total.mean:.4f} asr={m_asr.mean:.4f} "
-            f"align={m_align.mean:.4f} stab={m_stab.mean:.4f}\nCheckpoint -> {SAVE_PATH}\n"
-        )
-
-    print("Stage 2 training complete!")
-    logger.finish()
+    if ctx.is_main:
+        print("Stage 2 training complete!")
+        logger.finish()
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

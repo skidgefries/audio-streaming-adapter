@@ -44,17 +44,22 @@ def load_qwen_models(
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     load_kw: dict = dict(
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         low_cpu_mem_usage=True,
-        device_map=device_map,
     )
+    if device_map is not None:
+        load_kw["device_map"] = device_map
     if max_memory is not None:
         load_kw["max_memory"] = max_memory
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    target = torch.device(device)
+
     if embeddings_only:
         model = AutoModel.from_pretrained(model_id, **load_kw)
+        if device_map is None:
+            model = model.to(target)
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
@@ -62,6 +67,8 @@ def load_qwen_models(
         return QwenModels(model_id=model_id, tokenizer=tokenizer, causal_lm=None, embedder=embedder)
 
     causal_lm = AutoModelForCausalLM.from_pretrained(model_id, use_safetensors=True, **load_kw)
+    if device_map is None:
+        causal_lm = causal_lm.to(target)
     causal_lm.eval()
     for p in causal_lm.parameters():
         p.requires_grad = False

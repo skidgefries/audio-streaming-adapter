@@ -15,9 +15,9 @@ from llm import QwenConfig, load_qwen_models, QwenModels
 
 
 def default_device_and_dtype() -> tuple[str, torch.dtype]:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    return device, torch_dtype
+    if torch.cuda.is_available():
+        return "cuda:0", torch.bfloat16
+    return "cpu", torch.float32
 
 
 def load_frozen_whisper(*, model_id: str, device: str, torch_dtype: torch.dtype):

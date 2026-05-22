@@ -19,11 +19,32 @@ sys.path.insert(0, _src_root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
+from training.utils.env import env_str, load_project_env
+
+_env_path = load_project_env(_pkg_root)
+if _env_path:
+    print(f"Loaded environment from {_env_path}")
+
+_hf_token = env_str("HF_TOKEN")
+if _hf_token:
+    os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", _hf_token)
+
 from src.adapter.streaming_adapter import StreamingAdapter
 from src.dataset import LibriSpeechConfig, load_mono_waveform_16k, LibriSpeechPairsCustom, LibriSpeechPairs
 from src.encoder import WhisperWindowFeatureExtractor
-from training.utils.checkpointing import TrainingCheckpoint, save_checkpoint
-from training.utils.config import CheckpointConfig, DataConfig, OptimConfig, Stage1Config, WandbConfig
+from training.utils.checkpointing import (
+    TrainingCheckpoint,
+    maybe_upload_stage_epoch_checkpoint,
+    save_checkpoint,
+)
+from training.utils.config import (
+    CheckpointConfig,
+    DataConfig,
+    HfCheckpointConfig,
+    OptimConfig,
+    Stage1Config,
+    WandbConfig,
+)
 from training.utils.logging import WandbLogger
 from training.utils.losses import contrastive_infonce_loss
 from training.utils.metrics import RunningMean
@@ -49,6 +70,7 @@ DATA = DataConfig(
     max_windows_per_utt=None,
 )
 CKPT = CheckpointConfig(dir="checkpoints", save_every_epochs=1)
+HF_CKPT = HfCheckpointConfig.from_env()
 WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="s1-centred")
 
 SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage1.pt")
@@ -391,6 +413,15 @@ def train():
                 scheduler_state_dict=scheduler.state_dict(),
                 metrics={"loss": m_total.mean, "align": m_align.mean, "stability": m_stab.mean},
             ),
+        )
+        maybe_upload_stage_epoch_checkpoint(
+            EPOCH_SAVE_PATH,
+            stage=1,
+            repo_id=HF_CKPT.repo_id,
+            revision=HF_CKPT.revision,
+            private=HF_CKPT.private,
+            token=_hf_token,
+            enabled=HF_CKPT.upload_enabled,
         )
         print(f"Checkpoint saved to {SAVE_PATH}\n")
 

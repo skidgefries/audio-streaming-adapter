@@ -48,6 +48,28 @@ cd /home/ml/workspaces/kristina/audio-stream
 uv pip install -e audio-streaming-adapter/
 ```
 
+### Remote server bootstrap (Stage 2 training)
+
+1. Copy and edit environment variables:
+
+```bash
+cd audio-streaming-adapter
+cp .env.example .env
+# set CUDA_VISIBLE_DEVICES, WANDB_API_KEY, HF_TOKEN, etc.
+```
+
+2. Run the setup script (sources **`.env`** first, then pyenv 3.12, **`uv sync`**, **PyTorch CUDA compatibility check** with automatic wheel reinstall, LibriSpeech download, Stage 1 checkpoint fetch, and training):
+
+```bash
+bash scripts/setup_remote_training.sh
+```
+
+Setup only (no training): set `SKIP_TRAINING=1` in `.env` or export it before running the script.
+
+**Launchers:** one visible GPU → `uv run training/adapter_asr_trainer.py`; two or more → `torchrun --nproc_per_node=1` (frozen Qwen auto-shards across GPUs). Set `DEVICE=cpu` to force CPU. See `training/utils/config.py` (`DeviceConfig`, `TrainingLaunchConfig`).
+
+Requires **pyenv**, **uv**, and **wget** or **curl**.
+
 ### Dependencies
 
 ```
@@ -190,16 +212,29 @@ uv run python training/adapter_contrastive_trainer.py
 
 **What it does:** Keeps speech content while training compression / optional rate controller and gate losses (`training/adapter_asr_trainer.py`).
 
-**CLI (two GPUs recommended for Qwen3-8B):** Whisper, adapter, and gate stay on GPU 0; frozen Qwen shards across all visible devices with `device_map="auto"` and a reserved memory cap on GPU 0 (`Stage2DeviceConfig` in `training/utils/config.py`).
+**CLI (two GPUs recommended for Qwen3-8B):** All trainable modules and Whisper use CUDA (`DEVICE=cuda` by default). With two or more visible GPUs, the frozen Qwen model is sharded automatically via HuggingFace `device_map="auto"` — no manual memory fractions.
 
 ```bash
 cd audio-streaming-adapter
-CUDA_VISIBLE_DEVICES=0,1 uv run python training/adapter_asr_trainer.py
+# single GPU
+uv run training/adapter_asr_trainer.py
+
+# multi-GPU (2+ visible devices)
+torchrun --standalone --nnodes=1 --nproc_per_node=1 training/adapter_asr_trainer.py
 ```
 
-On a single GPU, omit `CUDA_VISIBLE_DEVICES` or set it to one index. If load still OOMs, raise `Stage2DeviceConfig.reserve_train_gpu_gib` (e.g. `18.0`) or lower `DataConfig.batch_size` in `adapter_asr_trainer.py`.
+On a single GPU, set `CUDA_VISIBLE_DEVICES=0` or leave one device visible. If training OOMs, enable `ENABLE_LLM_GRADIENT_CHECKPOINTING=true`, lower `MAX_WINDOWS_PER_UTT`, or reduce `BATCH_SIZE`.
 
-**Walkthrough:** `notebooks/training_stage2_asr.ipynb` — follow cells top-to-bottom; align hyperparameters with `Stage2Config`, `Stage2DeviceConfig`, `OptimConfig`, and constants at the top of `adapter_asr_trainer.py`.
+**Upload checkpoints to Hugging Face Hub** (after each epoch, requires `HF_TOKEN` with write access):
+
+```bash
+HF_CHECKPOINT_REPO=your-org/audio-streaming-adapter-checkpoints
+HF_UPLOAD_CHECKPOINTS=true
+```
+
+Each stage uploads only its own epoch files (`adapter_stage1_epoch{N}.pt`, `adapter_stage2_epoch{N}.pt`, `adapter_stage3_epoch{N}.pt`, …). Uploads are **additive** — existing files from other stages stay in the repo. Local resume checkpoints (`adapter_stage{N}.pt`) are not uploaded.
+
+**Walkthrough:** `notebooks/training_stage2_asr.ipynb` — follow cells top-to-bottom; align hyperparameters with `Stage2Config`, `DeviceConfig`, `OptimConfig`, and constants at the top of `adapter_asr_trainer.py`.
 
 ### Stage 3: Task distillation
 
