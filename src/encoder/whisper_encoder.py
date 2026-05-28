@@ -54,21 +54,33 @@ def encode_waveform_to_hidden(
     sample_rate: int = 16000,
 ) -> torch.Tensor:
     """
-    Encode a waveform into Whisper encoder hidden states `(1, T, D)`.
+    Encode a waveform into Whisper encoder hidden states ``(1, T, D)``.
 
-    `whisper_processor` expects CPU/NumPy-like audio. If a CUDA tensor is passed, it is
-    moved to CPU first.
+    Whisper's encoder requires mel length 3000 (30 s). Shorter clips are zero-padded
+    to 3000 mel frames; the encoder always returns **T=1500** downsampled frames.
+    No post-encode trimming is applied.
+
+    CUDA tensors are moved to CPU before feature extraction.
     """
     if isinstance(waveform, torch.Tensor):
-        waveform = waveform.detach().float().cpu()
+        wave = waveform.detach().float().cpu().reshape(-1)
+        wave_np = wave.numpy()
+    else:
+        wave_np = waveform
 
-    inputs = whisper_processor(waveform, sampling_rate=sample_rate, return_tensors="pt")
-    input_features = inputs.input_features.to(device, dtype=torch_dtype)
+    feature_extractor = whisper_processor.feature_extractor
+    mel_padded = feature_extractor(
+        wave_np,
+        sampling_rate=sample_rate,
+        return_tensors="pt",
+    )
+    input_features = mel_padded.input_features.to(device, dtype=torch_dtype)
 
     with torch.no_grad():
         encoder_outputs = whisper_model.model.encoder(input_features)
-    # Keep hidden states on the Whisper device (matches adapter / train stack on cuda:0).
+
     out = encoder_outputs.last_hidden_state
+
     target = next(whisper_model.parameters()).device
     if out.device != target or out.dtype != torch_dtype:
         out = out.to(device=target, dtype=torch_dtype)
@@ -96,7 +108,7 @@ def get_encoder_output(file_path: str, *, model_id: str = "openai/whisper-small"
     """
     Load an audio file and return Whisper encoder hidden states ``(1, T, D)`` (CPU float).
 
-    Typical: ``T`` ~1500 frames, ``D=768`` for whisper-small.
+    Typical: ``T=1500`` frames (Whisper 30 s canvas), ``D=768`` for whisper-small.
     """
     waveform = load_mono_waveform_16k(file_path)
     wm = _get_whisper_cached(model_id=model_id)

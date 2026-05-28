@@ -50,6 +50,37 @@ def load_adapter_state_dict(path: str) -> dict:
     return state
 
 
+def load_gate_state_dict_safe(
+    gate: torch.nn.Module,
+    ckpt: dict,
+    *,
+    warn: bool = True,
+) -> None:
+    """
+    Load ``gate_state_dict`` when present; warn on architecture mismatch.
+
+    Old mean-pool gate checkpoints are incompatible with :class:`TurnEndCommitGate`.
+    """
+    state = ckpt.get("gate_state_dict")
+    if state is None:
+        if warn:
+            print("[WARN] Checkpoint has no gate_state_dict; gate stays randomly initialized.")
+        return
+
+    result = gate.load_state_dict(state, strict=False)
+    if warn and (result.missing_keys or result.unexpected_keys):
+        print(
+            "[WARN] Gate checkpoint partial load — architecture may have changed "
+            f"(missing={len(result.missing_keys)}, unexpected={len(result.unexpected_keys)}). "
+            "Re-train the gate or use a TurnEndCommitGate checkpoint."
+        )
+        if result.missing_keys:
+            print(f"  missing: {result.missing_keys[:8]}{'...' if len(result.missing_keys) > 8 else ''}")
+        if result.unexpected_keys:
+            print(f"  unexpected: {result.unexpected_keys[:8]}{'...' if len(result.unexpected_keys) > 8 else ''}")
+
+
+
 def hub_path_for_stage_epoch_upload(local_path: str, *, stage: int) -> str:
     """
     Hub path for one epoch checkpoint of ``stage`` only (repo root, no prefix).

@@ -31,7 +31,6 @@ from training.utils.config import (
     StreamingAdapterTrainConfig,
     TuningConfig,
     WandbConfig,
-    WhisperFrameWindowingConfig,
     WhisperWaveformWindowingConfig,
 )
 from training.utils.loaders import (
@@ -75,7 +74,6 @@ __all__ = [
     "TrainingPipeline",
     "TuningConfig",
     "WandbConfig",
-    "WhisperFrameWindowingConfig",
     "WhisperWaveformWindowingConfig",
     "WandbLogger",
     "WhisperWindowFeatureExtractor",

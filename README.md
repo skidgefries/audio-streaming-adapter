@@ -133,7 +133,7 @@ Run training notebooks with the kernel’s **current working directory** set to 
 
 **CLI training** (full epochs, LibriSpeech): from the `audio-streaming-adapter/` directory, run `uv run python training/adapter_contrastive_trainer.py` (and similarly for stage 2/3). Scripts prepend `src/` to `sys.path` so `adapter`, `dataset`, `encoder`, and `llm` import correctly.
 
-**Hyperparameters** live in `training/utils/config.py` (`Stage1Config`, `Stage2Config`, `Stage3Config`, `OptimConfig`, `DataConfig`, plus optional `WhisperFrameWindowingConfig`, `StreamingAdapterTrainConfig`, `TuningConfig`, …). Edit those dataclasses (or duplicate fields near the top of a stage script) to compare runs.
+**Hyperparameters** live in `training/utils/config.py` (`Stage1Config`, `Stage2Config`, `Stage3Config`, `OptimConfig`, `DataConfig`, plus optional `WhisperWaveformWindowingConfig`, `StreamingAdapterTrainConfig`, `TuningConfig`, …). Edit those dataclasses (or duplicate fields near the top of a stage script) to compare runs.
 
 **Models and inference** use `src/encoder`, `src/llm`, `src/adapter`, and `src/adapter_llm_pipeline.py` — not copies under `training/utils/`.
 
@@ -195,7 +195,7 @@ Work from the **`audio-streaming-adapter/`** directory so `training/` and `check
 
 ### Stage 1: Contrastive audio–text alignment
 
-**What it does:** Aligns adapter token embeddings with frozen LLM text embeddings; loss `L = L_align + λ_stability · L_stability` using `training.utils.losses.contrastive_infonce_loss` and mean stability from `StreamingAdapter.forward_window`. Audio features use **`WhisperWindowFeatureExtractor`**: one full Whisper encode per utterance, then **`WhisperFrameWindowizer`** (0.8s / 0.4s in time) to build adapter windows—same as `adapter_contrastive_trainer.py`.
+**What it does:** Aligns adapter token embeddings with frozen LLM text embeddings; loss `L = L_align + λ_stability · L_stability` using `training.utils.losses.contrastive_infonce_loss` and mean stability from `StreamingAdapter.forward_window`. Audio features use **`WhisperWindowFeatureExtractor`**: **`AudioWaveformWindowizer`** (0.8s / 0.4s on raw waveform) → one Whisper encode per chunk — same as `adapter_contrastive_trainer.py`.
 
 **CLI (full training):**
 
@@ -236,6 +236,25 @@ Each stage uploads only its own epoch files (`adapter_stage1_epoch{N}.pt`, `adap
 
 **Walkthrough:** `notebooks/training_stage2_asr.ipynb` — follow cells top-to-bottom; align hyperparameters with `Stage2Config`, `DeviceConfig`, `OptimConfig`, and constants at the top of `adapter_asr_trainer.py`.
 
+### Evaluation: LibriSpeech ASR (WER / BLEU-4)
+
+`evaluation/eval_librispeech_asr_metrics.py` runs end-to-end transcription on test-clean and reports **avg WER** and **corpus BLEU-4** (same style as SALMONN `eval_librispeech_full_metrics.py`, ASR section only).
+
+- **Stage 1:** `WhisperAdapterLLMPipeline`, checkpoint from `adapter_contrastive_trainer.py` (`use_rate_controller=False`).
+- **Stage 2:** `WhisperAdapterLLMCommitGatePipeline`, checkpoint from `adapter_asr_trainer.py` (rate controller + early-commit gate). Training CE uses **`[audio tokens | im_end | teacher-forced transcript]`**; default ASR eval for stages **1–2** uses **`audio tokens → generate`** (do not append im_end at inference — Qwen3 treats it as chat). Chat tails after a blank line are trimmed. **`--prompt-asr`** switches to prompt+audio (`--asr-prompt`, chat template, `enable_thinking=False`) — the Stage 3 target path. Optional `--early-commit-truncation` for stage 2.
+
+```bash
+cd audio-streaming-adapter
+# Compare stage 1 vs stage 2 (writes outputs/asr_eval/asr_comparison.json)
+CUDA_VISIBLE_DEVICES=1 uv run evaluation/eval_librispeech_asr_metrics.py --compare-stages
+
+# Single checkpoint
+uv run evaluation/eval_librispeech_asr_metrics.py \
+  --checkpoint checkpoints/adapter_stage2.pt --stage 2 --num-samples 50
+```
+
+Retrieval-only scripts remain under `evaluation/eval_retrieval*.py`.
+
 ### Stage 3: Task distillation
 
 **What it does:** Teacher vs student frozen LLMs with adapter + optional gate (`training/adapter_task_trainer.py`); device split via `Stage3DeviceConfig`.
@@ -257,6 +276,16 @@ Before long runs:
 cd audio-streaming-adapter
 uv run python training/validate.py
 ```
+
+**Turn-end gate silence modes** (`GATE_SILENCE_MODE` in `.env`):
+
+| Mode | Behavior |
+|------|----------|
+| `rule` (default) | Fixed token-norm heuristics (`SilenceTracker`) |
+| `learned` | Trainable MLP on per-window tokens `Z_t` (`LearnedSilenceHead`) |
+| `both` | Run rule + learned paths in parallel; trains both classifiers; compare `gate_loss_rule` vs `gate_loss_learned` in logs |
+
+When `both`, set `GATE_ACTIVE_SILENCE_PATH=rule|learned` to pick which path drives `should_commit` at inference. Pipeline diagnostics include `early_commit_commit_probs_rule` and `early_commit_commit_probs_learned` when both are enabled.
 
 ## Architecture
 
@@ -292,11 +321,58 @@ Tokens ready for LLM ∈ R^{m × D_llm} (D_llm=4096)
 
 ### WhisperAdapterLLMPipeline (notebook / inference)
 
-`WhisperAdapterLLMPipeline` (in `src/adapter/adapter_llm_pipeline.py`) runs the full path: **waveform → Whisper encoder → `WhisperFrameWindowizer` → `StreamingAdapter` → causal LM**. Use `generate(waveform, n_windows=k, ...)` where `k` is how many overlapping windows (from the 1500-frame encode) feed the adapter for one LLM call; **`n_windows=-1`** uses every window. Import from `adapter` with `PYTHONPATH` including `src` (see notebooks).
+`WhisperAdapterLLMPipeline` (in `src/adapter_llm_pipeline.py`) runs the full path: **waveform → `AudioWaveformWindowizer` → Whisper encode per chunk → `StreamingAdapter` → causal LM**. Use `generate(waveform, n_windows=k, ...)` where `k` is how many overlapping windows feed the adapter for one LLM call; **`n_windows=-1`** uses every window. Import from `adapter` with `PYTHONPATH` including `src` (see notebooks).
 
 LLM decoding uses a **deep copy** of the model’s `GenerationConfig`. Default **`do_sample=True`**, with optional **`temperature`**, **`top_p`**, and **`top_k`** (defaults 0.7, 0.9, 50 when unset). With **`do_sample=False`**, those three are set to **`None`** so greedy decoding does not conflict with sampling fields. Prompt embeddings are concatenated with adapter tokens and an **`attention_mask`** of all ones is passed so `pad_token_id == eos_token_id` does not break masking.
 
 For extra detail on generation behavior, set the environment variable **`TRANSFORMERS_VERBOSITY=info`** before importing `transformers` (e.g. in the notebook: `os.environ.setdefault("TRANSFORMERS_VERBOSITY", "info")`).
+
+### Streaming KV-cache inference (Qwen3-8B)
+
+`WhisperAdapterLLMCommitGatePipeline.generate_streaming()` and `WhisperAdapterStreamingSession` (`src/adapter_llm_streaming.py`) implement the live path documented in `docs/EARLY_COMMIT.md`:
+
+1. Each 0.8s / 0.4s window → adapter compressed tokens → **append to Qwen3-8B KV-cache** (`LlmKvCacheSession`)
+2. `TurnEndCommitGate` on accumulated tokens each window
+3. On `should_commit` → decode from cache (no full-prefix re-encode)
+4. If no commit by end-of-audio → optional `finalize()` generation
+
+```python
+from adapter_llm_pipeline import WhisperAdapterLLMCommitGatePipeline
+from llm import load_qwen_models
+
+qwen = load_qwen_models(model_id="Qwen/Qwen3-8B", device="cuda", torch_dtype=torch.float16)
+pipeline = WhisperAdapterLLMCommitGatePipeline(..., llm_model=qwen.causal_lm, llm_tokenizer=qwen.tokenizer, ...)
+
+# Batch path (legacy): all windows → one generate()
+out = pipeline.generate(waveform, train_style_asr=True)
+
+# Streaming path: per-window KV-cache + generate on commit
+out = pipeline.generate_streaming(waveform, train_style_asr=True)
+print(out["first_token_time_s"], out["committed_on_gate"], out["text"])
+```
+
+For microphone-style ingestion, reuse one session:
+
+```python
+session = pipeline.create_streaming_session()
+session.begin(train_style_asr=True)
+for chunk in live_audio_chunks:  # each ≥ 0.8s window of 16 kHz mono
+    step = session.push_waveform(chunk)
+    if session.committed:
+        print(step.generated_text)
+        break
+result = session.finalize(force_generate=True)
+```
+
+Runnable demo (synthetic 2.4s audio, stage-2 checkpoint, Qwen3-8B):
+
+```bash
+cd audio-streaming-adapter && source .venv/bin/activate
+PYTHONPATH=src:training python examples/streaming_demo.py
+
+# If GPUs are full:
+CUDA_VISIBLE_DEVICES= python examples/streaming_demo.py --device cpu --max-new-tokens 16
+```
 
 **Other log noise:** set **`TOKENIZERS_PARALLELISM=false`** when using a multithreaded `DataLoader` (see notebook cell 0). For Whisper ASR in the walkthrough, call the pipeline with **`generate_kwargs={"language": "en", "task": "transcribe"}`** to reduce deprecated `forced_decoder_ids` / multilingual default messages (some logits-processor messages may still appear depending on `transformers` version).
 

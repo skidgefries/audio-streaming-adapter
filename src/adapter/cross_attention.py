@@ -101,6 +101,8 @@ class QFormerLayer(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         dropout: nn.Dropout,
+        *,
+        key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Shared multi-head attention logic for both self and cross attention.
@@ -109,6 +111,7 @@ class QFormerLayer(nn.Module):
             q: (batch, seq_q, d_model) — already projected queries
             k: (batch, seq_k, d_model) — already projected keys
             v: (batch, seq_k, d_model) — already projected values
+            key_padding_mask: (batch, seq_k) bool, True = ignore key position
             dropout: dropout module for attention weights
 
         Returns:
@@ -117,17 +120,19 @@ class QFormerLayer(nn.Module):
         batch_size, seq_q, _ = q.shape
         seq_k = k.shape[1]
 
-        # Reshape to multi-head: (batch, seq, d_model) → (batch, heads, seq, d_head)
         q = q.view(batch_size, seq_q, self.num_heads, self.d_head).transpose(1, 2)
         k = k.view(batch_size, seq_k, self.num_heads, self.d_head).transpose(1, 2)
         v = v.view(batch_size, seq_k, self.num_heads, self.d_head).transpose(1, 2)
 
-        # Scaled dot-product attention
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        if key_padding_mask is not None:
+            attn_scores = attn_scores.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2),
+                torch.finfo(attn_scores.dtype).min,
+            )
         attn_weights = torch.softmax(attn_scores, dim=-1)
         attn_weights = dropout(attn_weights)
 
-        # Weighted sum and merge heads
         output = torch.matmul(attn_weights, v)
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_q, self.d_model)
 
@@ -137,16 +142,22 @@ class QFormerLayer(nn.Module):
         self,
         queries: torch.Tensor,
         encoder_features: torch.Tensor,
+        *,
+        encoder_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             queries: (batch, m, d_model) — learnable query vectors
             encoder_features: (batch, T, d_model) — Whisper encoder output
+            encoder_attention_mask: (batch, T) with 1 on real frames, 0 on padded tail
 
         Returns:
             (batch, m, d_model) — updated query representations
         """
-        # ---- Sub-layer 1: Self-Attention (queries attend to each other) ----
+        key_padding_mask = None
+        if encoder_attention_mask is not None:
+            key_padding_mask = encoder_attention_mask == 0
+
         q_norm = self.norm_self(queries)
         sa_out = self._multihead_attention(
             q=self.self_attn_q(q_norm),
@@ -155,9 +166,8 @@ class QFormerLayer(nn.Module):
             dropout=self.self_attn_dropout,
         )
         sa_out = self.self_attn_o(sa_out)
-        queries = queries + sa_out  # residual
+        queries = queries + sa_out
 
-        # ---- Sub-layer 2: Cross-Attention (queries attend to encoder) ----
         if self.use_cross_attention:
             q_norm = self.norm_cross_q(queries)
             kv_norm = self.norm_cross_kv(encoder_features)
@@ -166,12 +176,12 @@ class QFormerLayer(nn.Module):
                 k=self.cross_attn_k(kv_norm),
                 v=self.cross_attn_v(kv_norm),
                 dropout=self.cross_attn_dropout,
+                key_padding_mask=key_padding_mask,
             )
             ca_out = self.cross_attn_o(ca_out)
-            queries = queries + ca_out  # residual
+            queries = queries + ca_out
 
-        # ---- Sub-layer 3: FFN ----
-        queries = queries + self.ffn(self.norm_ffn(queries))  # residual
+        queries = queries + self.ffn(self.norm_ffn(queries))
 
         return queries
 

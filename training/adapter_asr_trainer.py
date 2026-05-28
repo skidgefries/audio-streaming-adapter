@@ -1,5 +1,20 @@
 """
-Stage 2: ASR distillation — frozen Whisper + frozen Qwen, train StreamingAdapter + EarlyCommitGate.
+Stage 2: ASR distillation — frozen Whisper + frozen Qwen, train StreamingAdapter + TurnEndCommitGate.
+
+The turn-end gate (Component 3) replaces separate VAD/turn detection: it classifies accumulated
+adapter tokens and triggers LLM generation when ``should_commit`` fires. See ``docs/EARLY_COMMIT.md``.
+
+LM conditioning during training is **train-style**: ``[audio_tokens | BOS | teacher-forced
+transcript embeddings]`` with CE loss on the reference text (no ASR instruction prompt).
+Prompt-based inference (``--asr-prompt`` + audio) is the target for Stage 3; use
+``evaluation/eval_librispeech_asr_metrics.py --prompt-asr`` to evaluate that path.
+
+Gate label sources (``GATE_LABEL_SOURCE``):
+  - ``synthetic`` (default): final window label=1 on LibriSpeech full utterances
+  - ``smart_turn``: gate-only fine-tune on pipecat Smart Turn ``endpoint_bool`` labels
+
+# Previous gate import (reference):
+# from src.adapter.early_commit_gate import EarlyCommitGate
 
 Configuration is loaded from ``.env`` in the package root (see ``.env.example``).
 
@@ -52,11 +67,18 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from src.adapter.streaming_adapter import StreamingAdapter
-from src.adapter.early_commit_gate import EarlyCommitGate
-from src.dataset import LibriSpeechConfig, LibriSpeechPairs, load_mono_waveform_16k
+from src.adapter.turn_end_commit_gate import TurnEndCommitGate
+from src.dataset import (
+    LibriSpeechConfig,
+    LibriSpeechPairs,
+    SmartTurnGateDataset,
+    load_mono_waveform_16k,
+    smart_turn_collate,
+)
 from src.encoder import WhisperWindowFeatureExtractor
 from training.utils.checkpointing import (
     TrainingCheckpoint,
+    load_gate_state_dict_safe,
     maybe_upload_stage_epoch_checkpoint,
     save_checkpoint,
 )
@@ -65,11 +87,13 @@ from training.utils.config import (
     DataConfig,
     DeviceConfig,
     FrozenModelIdsConfig,
+    GateConfig,
     HfCheckpointConfig,
     OptimConfig,
     Stage2Config,
     WandbConfig,
 )
+from training.utils.gate_training import endpoint_label_for_timestep, make_silence_trackers
 from training.utils.devices import (
     cleanup_distributed,
     init_training_context,
@@ -79,6 +103,7 @@ from training.utils.devices import (
 from training.utils.logging import WandbLogger
 from training.utils.losses import contrastive_infonce_loss
 from training.utils.metrics import RunningMean
+from training.utils.asr_prompt import DEFAULT_ASR_PROMPT, PROMPT_CONDITIONING, TRAIN_STYLE_CONDITIONING
 from training.utils.loaders import default_device_and_dtype, load_frozen_qwen_causal_lm
 from training.utils.optimization import TrainingPipeline
 
@@ -91,6 +116,7 @@ WHISPER_MODEL = MODEL_IDS.whisper_model_id
 LLM_MODEL_ID = MODEL_IDS.llm_model_id
 
 STAGE = Stage2Config.from_env()
+GATE = GateConfig.from_env()
 DEVICE_CFG = DeviceConfig.from_env()
 OPT = OptimConfig.from_env()
 DATA = DataConfig.from_env(
@@ -166,6 +192,110 @@ def _unwrap(module: torch.nn.Module) -> torch.nn.Module:
     return module.module if isinstance(module, DDP) else module
 
 
+def train_smart_turn_gate(ctx, *, train_device, audio, adapter, gate, pipeline, optimizer, scheduler, logger) -> None:
+    """Gate-only fine-tune on Smart Turn endpoint labels; adapter frozen."""
+    adapter_module = _unwrap(adapter)
+    gate_module = _unwrap(gate)
+    for p in adapter_module.parameters():
+        p.requires_grad = False
+    adapter_module.eval()
+
+    dataset = SmartTurnGateDataset(
+        GATE.smart_turn_dataset,
+        split=GATE.smart_turn_split,
+        max_samples=GATE.smart_turn_max_samples,
+    )
+    sampler: DistributedSampler | None = None
+    if ctx.world_size > 1:
+        sampler = DistributedSampler(dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=DATA.num_workers,
+        collate_fn=smart_turn_collate,
+    )
+
+    trainable_params = list(gate_module.parameters())
+    if ctx.is_main:
+        print("\nStarting Stage 2 gate fine-tune: Smart Turn labels (adapter frozen)")
+        print(f"  Dataset: {GATE.smart_turn_dataset} [{GATE.smart_turn_split}]")
+        print(f"  Clips: {len(dataset)}\n")
+
+    for epoch in range(STAGE.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        m_gate = RunningMean()
+
+        for step, batch in enumerate(dataloader):
+            waveforms, endpoint_labels = batch
+            wave = waveforms[0].to(train_device)
+            endpoint = endpoint_labels[0, 0].item()
+
+            windows = audio.waveform_to_windows(wave)
+            if DATA.max_windows_per_utt is not None:
+                windows = windows[: DATA.max_windows_per_utt]
+            if not windows:
+                continue
+
+            adapter_module.reset_streaming_state()
+            silence_tracker, learned_silence_tracker = make_silence_trackers(gate_module)
+            utterance_tokens: list[torch.Tensor] = []
+            total_gate_loss = torch.zeros((), device=train_device, dtype=torch.float32)
+            gate_calls = 0
+
+            with torch.no_grad():
+                for t, window in enumerate(windows):
+                    result = adapter_module.forward_window(
+                        window.to(device=train_device, dtype=TORCH_DTYPE)
+                    )
+                    utterance_tokens.append(result["tokens"])
+
+            for t in range(len(utterance_tokens)):
+                accumulated = torch.cat(utterance_tokens[: t + 1], dim=1)
+                win_tokens = utterance_tokens[t]
+                gate_result = gate_module(
+                    accumulated,
+                    t,
+                    len(windows),
+                    endpoint_label=endpoint,
+                    silence_tracker=silence_tracker,
+                    learned_silence_tracker=learned_silence_tracker,
+                    window_tokens=win_tokens,
+                )
+                total_gate_loss = total_gate_loss + gate_result["gate_loss"].float()
+                gate_calls += 1
+
+            gate_loss_mean = total_gate_loss / float(max(gate_calls, 1))
+            total_loss = STAGE.lambda_gate * gate_loss_mean
+            pipeline.step(total_loss, trainable_params)
+            m_gate.update(float(gate_loss_mean.item()))
+
+            if ctx.is_main and step % 10 == 0:
+                print(
+                    f"Step {step:4d}/{len(dataloader)} | Gate: {gate_loss_mean.item():.4f} | "
+                    f"endpoint={endpoint:.0f}"
+                )
+                logger.log({"train/gate": gate_loss_mean.item()}, step=pipeline.global_step)
+
+        if ctx.is_main:
+            save_checkpoint(
+                SAVE_PATH,
+                TrainingCheckpoint(
+                    stage=2,
+                    epoch=epoch + 1,
+                    global_step=pipeline.global_step,
+                    adapter_state_dict=adapter_module.state_dict(),
+                    gate_state_dict=gate_module.state_dict(),
+                    optimizer_state_dict=optimizer.state_dict(),
+                    scheduler_state_dict=scheduler.state_dict(),
+                    metrics={"gate": m_gate.mean},
+                ),
+            )
+            print(f"\nEpoch {epoch + 1} gate fine-tune complete: gate={m_gate.mean:.4f}\n")
+
+
 def train() -> None:
     ctx = init_training_context()
     train_device = ctx.device
@@ -228,11 +358,19 @@ def train() -> None:
             f"(epoch {stage1_ckpt.get('epoch', '?')})"
         )
 
-    gate = EarlyCommitGate(
+    # gate = EarlyCommitGate(d_llm=LLM_DIM, hidden_dim=256, threshold=0.5, latency_weight=0.1)
+    gate = TurnEndCommitGate(
         d_llm=LLM_DIM,
-        hidden_dim=256,
-        threshold=0.5,
-        latency_weight=0.1,
+        hidden_dim=GATE.hidden_dim,
+        threshold=GATE.threshold,
+        latency_weight=GATE.latency_weight,
+        min_silence_ms=GATE.min_silence_ms,
+        require_silence_for_commit=GATE.require_silence_for_commit,
+        token_activity_threshold=GATE.token_activity_threshold,
+        window_duration_sec=GATE.window_seconds,
+        silence_mode=GATE.silence_mode,
+        active_silence_path=GATE.active_silence_path,
+        learned_silence_hidden_dim=GATE.learned_silence_hidden_dim,
     ).to(train_device, dtype=TORCH_DTYPE)
     gate.train()
 
@@ -242,7 +380,10 @@ def train() -> None:
 
     if ctx.is_main:
         print(
-            f"Models initialized:\n  Adapter: trainable\n  Early-commit gate: trainable\n"
+            f"Models initialized:\n  Adapter: trainable\n  Turn-end gate: trainable\n"
+            f"  Gate labels: {GATE.label_source}\n"
+            f"  Gate silence mode: {GATE.silence_mode}"
+            f"{f' (active={GATE.active_silence_path})' if GATE.silence_mode == 'both' else ''}\n"
             f"  Rate controller: {USE_RATE_CONTROLLER}\n"
         )
 
@@ -279,6 +420,7 @@ def train() -> None:
             "data": DATA.__dict__,
             "optim": OPT.__dict__,
             "stage_cfg": STAGE.__dict__,
+            "gate_cfg": GATE.__dict__,
             "device": DEVICE_CFG.__dict__,
             "num_cuda_devices": ctx.num_cuda_devices,
             "model_parallel": ctx.model_parallel,
@@ -291,7 +433,7 @@ def train() -> None:
         print(f"Resuming from checkpoint: {SAVE_PATH}")
         ckpt = torch.load(SAVE_PATH, map_location=train_device)
         _unwrap(adapter).load_state_dict(ckpt["adapter_state_dict"])
-        _unwrap(gate).load_state_dict(ckpt["gate_state_dict"])
+        load_gate_state_dict_safe(_unwrap(gate), ckpt)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt["epoch"]
         pipeline.global_step = ckpt["global_step"]
@@ -310,10 +452,36 @@ def train() -> None:
         print(f"  λ_stability: {STAGE.lambda_stability}")
         print(f"  λ_rate: {STAGE.lambda_rate}")
         print(f"  λ_gate: {STAGE.lambda_gate}")
+        print(f"  Gate label source: {GATE.label_source}")
         print(f"  Rate target: {RATE_TARGET} tokens/window")
-        print(f"  Max windows/utt: {DATA.max_windows_per_utt}")
+        max_windows_label = (
+            "all" if DATA.max_windows_per_utt is None else str(DATA.max_windows_per_utt)
+        )
+        print(f"  Max windows/utt: {max_windows_label}")
         print(f"  Max text tokens: {STAGE.max_text_tokens}")
-        print(f"  ASR micro-batch: {STAGE.asr_micro_batch_size}\n")
+        print(f"  ASR micro-batch: {STAGE.asr_micro_batch_size}")
+        print(f"  LM conditioning: {TRAIN_STYLE_CONDITIONING}")
+        print(
+            f"  Stage 3 target ({PROMPT_CONDITIONING}): {DEFAULT_ASR_PROMPT[:72]}...\n"
+        )
+
+    if GATE.label_source == "smart_turn":
+        train_smart_turn_gate(
+            ctx,
+            train_device=train_device,
+            audio=audio,
+            adapter=adapter,
+            gate=gate,
+            pipeline=pipeline,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            logger=logger,
+        )
+        if ctx.is_main:
+            print("Stage 2 Smart Turn gate fine-tune complete!")
+            logger.finish()
+        cleanup_distributed()
+        return
 
     for epoch in range(start_epoch, STAGE.epochs):
         if sampler is not None:
@@ -365,6 +533,7 @@ def train() -> None:
                     windows = windows[: DATA.max_windows_per_utt]
 
                 adapter_module.reset_streaming_state()
+                silence_tracker, learned_silence_tracker = make_silence_trackers(gate_module)
                 utterance_tokens: list[torch.Tensor] = []
                 for t, window in enumerate(windows):
                     result = adapter_module.forward_window(
@@ -376,11 +545,26 @@ def train() -> None:
                         total_sparse_loss = total_sparse_loss + result["sparse_loss"].float()
                     if result["rate_loss"] is not None:
                         total_rate_loss = total_rate_loss + result["rate_loss"].float()
-                    if t > 0:
-                        accumulated = torch.cat(utterance_tokens[:t], dim=1)
-                        gate_result = gate_module(accumulated, t, len(windows))
-                        total_gate_loss = total_gate_loss + gate_result["gate_loss"].float()
-                        gate_calls += 1
+
+                    accumulated = torch.cat(utterance_tokens, dim=1)
+                    endpoint = endpoint_label_for_timestep(
+                        t,
+                        len(windows),
+                        batch_size=accumulated.shape[0],
+                        device=train_device,
+                    )
+                    win_tokens = utterance_tokens[t]
+                    gate_result = gate_module(
+                        accumulated,
+                        t,
+                        len(windows),
+                        endpoint_label=endpoint,
+                        silence_tracker=silence_tracker,
+                        learned_silence_tracker=learned_silence_tracker,
+                        window_tokens=win_tokens,
+                    )
+                    total_gate_loss = total_gate_loss + gate_result["gate_loss"].float()
+                    gate_calls += 1
 
                 if utterance_tokens:
                     tokens = torch.cat(utterance_tokens, dim=1)

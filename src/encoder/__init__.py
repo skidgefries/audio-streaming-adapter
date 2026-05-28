@@ -3,7 +3,7 @@ Audio encoder subpackage.
 
 - `WhisperConfig`, `load_whisper_models`
 - `encode_waveform_to_hidden`, `get_encoder_output`, `encode_dataset_stream` (``whisper_encoder.py``)
-- `WhisperWindowFeatureExtractor` (full encode, then :class:`adapter.windowing.WhisperFrameWindowizer`)
+- `WhisperWindowFeatureExtractor` (raw-audio windows → per-chunk Whisper encode)
 - `load_whisper_asr_models` (HF ASR pipeline)
 """
 

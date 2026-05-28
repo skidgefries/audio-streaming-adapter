@@ -63,6 +63,8 @@ class AdaptiveRateController(nn.Module):
         self,
         encoder_features: torch.Tensor,
         tokens: torch.Tensor,
+        *,
+        encoder_attention_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Compute gated tokens based on input complexity.
@@ -78,8 +80,14 @@ class AdaptiveRateController(nn.Module):
                 sparse_loss: scalar -- L_sparse (encourages fewer active tokens)
                 rate_loss: scalar -- L_rate (penalizes deviation from target rate)
         """
-        # Pool encoder features to get a single complexity vector
-        pooled = encoder_features.mean(dim=1)  # (batch, d_encoder)
+        # Pool encoder features to get a single complexity vector (masked mean when provided)
+        if encoder_attention_mask is not None:
+            weights = encoder_attention_mask.unsqueeze(-1).to(
+                dtype=encoder_features.dtype, device=encoder_features.device
+            )
+            pooled = (encoder_features * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+        else:
+            pooled = encoder_features.mean(dim=1)
 
         # Compute per-query gate scores
         gate_scores = torch.sigmoid(self.gate_mlp(pooled))  # (batch, m_max)
@@ -90,7 +98,7 @@ class AdaptiveRateController(nn.Module):
         else:
             # Hard gating: zero out tokens below threshold
             mask = (gate_scores > self.threshold).unsqueeze(-1)  # (batch, m, 1)
-            gated = tokens * mask.float()
+            gated = tokens * mask.to(tokens.dtype)
 
         # L_sparse: encourage sparsity (L1 on gate scores)
         # Lower gate scores = fewer active tokens = more compression

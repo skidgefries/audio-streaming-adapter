@@ -1,31 +1,27 @@
 """
-Overlapping windows for the adapter stack, using :class:`adapter.windowing.WhisperFrameWindowizer`.
+Per-window Whisper encoding for the adapter stack.
 
-Flow: **one** Whisper encode for the full utterance → slice encoder frames into
-``(1, W, D)`` windows (default 0.8s / 0.4s in **time**, mapped to frame counts via
-``chunk_seconds`` = utterance length).
+Flow: raw waveform → :class:`adapter.windowing.AudioWaveformWindowizer` (0.8s / 0.4s)
+→ **one Whisper encode per audio chunk** → ``(1, 1500, D_enc)`` adapter inputs (30 s padded canvas).
 
-This shares window math with :class:`adapter_llm_pipeline.WhisperAdapterLLMPipeline`
-(full encode + frame windowing). It is **not** the same as running Whisper separately
-on each raw waveform slice.
+This matches true streaming: each adapter step only sees the encoder output for its
+own audio window, not a slice of a full-utterance encode.
 """
 
 from __future__ import annotations
 
 import torch
 
-from adapter.windowing import WhisperFrameWindowizer
+from adapter.windowing import AudioWaveformWindowizer
 
 from .whisper_encoder import encode_waveform_to_hidden, load_whisper_models
 
 
 class WhisperWindowFeatureExtractor:
     """
-    Full-utterance Whisper encode, then overlapping **frame** windows for each adapter step.
+    Overlapping **raw-audio** windows, then Whisper encode each chunk for adapter steps.
 
-    Default time geometry matches the research spec: 0.8s windows, 0.4s stride (see
-    :class:`WhisperFrameWindowizer`). ``chunk_seconds`` is set to the utterance duration
-    so frames-per-second matches that clip (``fps = T / duration``).
+    Default time geometry: 0.8s windows, 0.4s stride @ 16 kHz.
     """
 
     def __init__(
@@ -44,11 +40,16 @@ class WhisperWindowFeatureExtractor:
         self.window_seconds = float(window_seconds)
         self.stride_seconds = float(stride_seconds)
         self.sample_rate = int(sample_rate)
-        self.chunk_seconds_override = None
 
         wm = load_whisper_models(model_id=model_id, device=device, torch_dtype=torch_dtype)
         self.processor = wm.processor
         self.whisper = wm.model
+
+        self._audio_windowizer = AudioWaveformWindowizer(
+            sample_rate=self.sample_rate,
+            window_seconds=self.window_seconds,
+            stride_seconds=self.stride_seconds,
+        )
 
     def waveform_to_windows(self, waveform_16k_mono: torch.Tensor) -> list[torch.Tensor]:
         """
@@ -56,7 +57,7 @@ class WhisperWindowFeatureExtractor:
             waveform_16k_mono: 1D CPU or CUDA tensor (audio samples at ``sample_rate``)
 
         Returns:
-            List of encoder windows, each ``(1, W, D_enc)`` on ``device``.
+            List of encoder windows, each ``(1, 1500, D_enc)`` on ``device``.
         """
         if isinstance(waveform_16k_mono, torch.Tensor):
             wave = waveform_16k_mono.detach().float().cpu()
@@ -66,32 +67,17 @@ class WhisperWindowFeatureExtractor:
         if wave.numel() == 0:
             return []
 
-        duration_s = float(wave.numel()) / float(self.sample_rate)
-        chunk_s = self.chunk_seconds_override if self.chunk_seconds_override is not None else duration_s
-        if chunk_s <= 0:
-            return []
-
         dev = torch.device(self.device)
-        enc = encode_waveform_to_hidden(
-            wave,
-            whisper_processor=self.processor,
-            whisper_model=self.whisper,
-            device=self.device,
-            torch_dtype=self.torch_dtype,
-            sample_rate=self.sample_rate,
-        ).to(device=dev, dtype=self.torch_dtype)
-
-        windowizer = WhisperFrameWindowizer(
-            window_seconds=self.window_seconds,
-            stride_seconds=self.stride_seconds,
-        )
-        try:
-            windows = windowizer(enc)
-        except ValueError:
-            return []
-
-        n = windows.shape[1]
-        return [
-            windows[0, i].unsqueeze(0).to(device=dev, dtype=self.torch_dtype).contiguous()
-            for i in range(n)
-        ]
+        audio_chunks = self._audio_windowizer(wave)
+        enc_windows: list[torch.Tensor] = []
+        for chunk in audio_chunks:
+            enc = encode_waveform_to_hidden(
+                chunk,
+                whisper_processor=self.processor,
+                whisper_model=self.whisper,
+                device=self.device,
+                torch_dtype=self.torch_dtype,
+                sample_rate=self.sample_rate,
+            ).to(device=dev, dtype=self.torch_dtype)
+            enc_windows.append(enc.contiguous())
+        return enc_windows

@@ -1,11 +1,9 @@
 """
-Retrieval evaluation using NLL scoring (Audio → Text).
+NLL retrieval evaluation for Stage 2 (ASR distillation) checkpoints.
 
-Instead of cosine similarity between pooled embeddings, this script ranks candidate
-transcripts by *negative log-likelihood* under the frozen Qwen causal LM,
-conditioned on the adapter-produced audio prefix tokens.
-
-Lower NLL => better match.
+Same metrics and procedure as ``eval_retrieval_nll.py`` (R@1, R@5, R@10 via mean
+token NLL under frozen Qwen), but builds :class:`StreamingAdapter` with Stage 2
+options (rate controller, etc.) so ``adapter_stage2.pt`` loads cleanly.
 
 Loads Whisper + adapter first, encodes audio prefixes, then frees them before
 loading the causal LM to reduce peak VRAM on a single GPU.
@@ -29,25 +27,27 @@ sys.path.insert(0, _pkg_root)
 from src.adapter.streaming_adapter import StreamingAdapter
 from src.dataset import LibriSpeechPairs, load_mono_waveform_16k
 from src.encoder.waveform_window_encoder import WhisperWindowFeatureExtractor, unpack_encoder_window
+from training.utils.config import Stage2Config
 from training.utils.devices import llm_input_device
 from training.utils.env import env_int
 from training.utils.loaders import default_device_and_dtype, load_frozen_qwen_causal_lm
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEVICE, TORCH_DTYPE = default_device_and_dtype()
+STAGE2 = Stage2Config.from_env()
 
 WHISPER_DIM = 768
 LLM_DIM = 4096
 WHISPER_MODEL = "openai/whisper-small"
 LLM_MODEL_ID = "Qwen/Qwen3-8B"
 
-CHECKPOINT_PATH = "checkpoints/adapter_stage1.pt"
-# CHECKPOINT_PATH = "checkpoints/adapter_stage2.pt"
-TEST_CLEAN_ROOT = "datasets/librispeech_data/LibriSpeech/test-clean"
+CHECKPOINT_PATH = os.path.join(_pkg_root, "checkpoints", "adapter_stage2.pt")
+TEST_CLEAN_ROOT = os.path.join(
+    _pkg_root, "datasets/librispeech_data/LibriSpeech/test-clean"
+)
 NUM_UTTERANCES = env_int("RETRIEVAL_NLL_NUM_UTTERANCES", 100)
-
 CANDIDATE_BATCH_SIZE = env_int("RETRIEVAL_NLL_BATCH_SIZE", 8)
-MAX_TEXT_TOKENS = 256
+MAX_TEXT_TOKENS = STAGE2.max_text_tokens
 
 
 def _maybe_autocast():
@@ -72,7 +72,7 @@ def load_audio_encoder_and_adapter(checkpoint_path: str = CHECKPOINT_PATH):
         torch_dtype=TORCH_DTYPE,
     )
 
-    print("Loading adapter from checkpoint...")
+    print("Loading Stage 2 adapter from checkpoint...")
     adapter = StreamingAdapter(
         d_encoder=WHISPER_DIM,
         d_llm=LLM_DIM,
@@ -83,13 +83,19 @@ def load_audio_encoder_and_adapter(checkpoint_path: str = CHECKPOINT_PATH):
         dropout=0.0,
         ema_alpha=0.8,
         learnable_ema=False,
-        use_rate_controller=False,
+        use_rate_controller=STAGE2.use_rate_controller,
+        rate_threshold=0.5,
+        target_rate=STAGE2.rate_target,
     ).to(DEVICE, dtype=torch.bfloat16)
 
     ckpt = torch.load(checkpoint_path, map_location=DEVICE)
     adapter.load_state_dict(ckpt["adapter_state_dict"])
     adapter.eval()
-    print(f"  Loaded checkpoint from epoch {ckpt['epoch']}, step {ckpt['global_step']}\n")
+    print(
+        f"  Loaded {checkpoint_path}\n"
+        f"  epoch={ckpt.get('epoch', '?')} step={ckpt.get('global_step', '?')} "
+        f"rate_controller={STAGE2.use_rate_controller} target_rate={STAGE2.rate_target}\n"
+    )
     return audio, adapter
 
 
@@ -247,7 +253,6 @@ def nll_matrix(
 
 def compute_recall_from_nll(nll_scores, ks=(1, 5, 10)):
     n = nll_scores.shape[0]
-
     ranked = nll_scores.argsort(dim=1, descending=False)
 
     results = {}
@@ -304,7 +309,7 @@ def main():
     results = compute_recall_from_nll(nll_scores)
 
     print("\n" + "=" * 50)
-    print("RETRIEVAL RESULTS (Audio → Text, NLL)")
+    print("RETRIEVAL RESULTS — Stage 2 checkpoint (Audio → Text, NLL)")
     print("=" * 50)
     for k, v in results.items():
         print(f"  {k}: {v:.2f}%")

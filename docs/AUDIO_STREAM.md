@@ -5,25 +5,28 @@
 1. [Problem Statement](#1-problem-statement)
 2. [Solution Overview](#2-solution-overview)
 3. [System Architecture (4 Components)](#3-system-architecture-4-components)
-4. [Streaming Pipeline](#4-streaming-pipeline)
-5. [Component 2: Streaming Adapter Network](#5-component-2-streaming-adapter-network)
-6. [Component 3: Early-Commit Gate](#6-component-3-early-commit-gate)
-7. [Loss Functions by Training Stage](#7-loss-functions-by-training-stage)
-8. [Stage 1: Contrastive Audio–Text Alignment](#8-stage-1-contrastive-audiotext-alignment)
-   - [The Cone Collapse Problem](#81-the-cone-collapse-problem)
-   - [The Fix: Batch Centering](#82-the-fix-batch-centering)
-9. [Stage 2: Content Preservation (ASR Distillation)](#9-stage-2-content-preservation-asr-distillation)
-10. [Stage 3: Task Distillation (Streaming)](#10-stage-3-task-distillation-streaming)
-11. [Evaluation Strategy](#11-evaluation-strategy)
-12. [Baseline: SALMONN-7B](#12-baseline-salmonn-7b)
-    - [What SALMONN Does Well](#121-what-salmonn-does-well)
-    - [Why Cosine Retrieval is Misleading for SALMONN](#122-why-cosine-retrieval-is-misleading-for-salmonn)
-    - [Evaluation Script](#123-evaluation-script)
-13. [Our System vs. SALMONN Baseline](#13-our-system-vs-salmonn-baseline)
-14. [Key Differences Summary](#14-key-differences-summary)
-15. [Theoretical Foundation](#15-theoretical-foundation)
-16. [Related Work](#16-related-work)
-17. [Current Status](#17-current-status)
+4. [Complete Inference Pipeline](#4-complete-inference-pipeline)
+5. [Complete Training Pipeline](#5-complete-training-pipeline)
+6. [Component 2: Streaming Adapter Network](#6-component-2-streaming-adapter-network)
+7. [Component 3: Turn-End Commit Gate](#7-component-3-turn-end-commit-gate)
+   - [VAD vs Turn Detection](#71-vad-vs-turn-detection)
+   - [Combining VAD + Turn Detection](#combining-vad--turn-detection)
+8. [Loss Functions by Training Stage](#8-loss-functions-by-training-stage)
+9. [Stage 1: Contrastive Audio–Text Alignment](#9-stage-1-contrastive-audiotext-alignment)
+   - [The Cone Collapse Problem](#91-the-cone-collapse-problem)
+   - [The Fix: Batch Centering](#92-the-fix-batch-centering)
+10. [Stage 2: Content Preservation (ASR Distillation)](#10-stage-2-content-preservation-asr-distillation)
+11. [Stage 3: Task Distillation (Streaming)](#11-stage-3-task-distillation-streaming)
+12. [Evaluation Strategy](#12-evaluation-strategy)
+13. [Baseline: SALMONN-7B](#13-baseline-salmonn-7b)
+    - [What SALMONN Does Well](#131-what-salmonn-does-well)
+    - [Why Cosine Retrieval is Misleading for SALMONN](#132-why-cosine-retrieval-is-misleading-for-salmonn)
+    - [Evaluation Script](#133-evaluation-script)
+14. [Our System vs. SALMONN Baseline](#14-our-system-vs-salmonn-baseline)
+15. [Key Differences Summary](#15-key-differences-summary)
+16. [Theoretical Foundation](#16-theoretical-foundation)
+17. [Related Work](#17-related-work)
+18. [Current Status](#18-current-status)
 
 ---
 
@@ -53,53 +56,260 @@ Only the adapter (and optionally the early-commit gate) are trained. The audio e
 
 ## 3. System Architecture (4 Components)
 
-![System Architecture](assets/architecture.png)
+| # | Component | Module | Trainable | Role |
+|---|-----------|--------|-----------|------|
+| 1 | Audio encoder | `src/encoder/whisper_encoder.py` | **Frozen** | Mono 16 kHz waveform → Whisper encoder hidden states |
+| 2 | Streaming adapter | `src/adapter/streaming_adapter.py` | **Yes** | Encoder frames → compressed LLM-space tokens |
+| 3 | Turn-end commit gate | `src/adapter/turn_end_commit_gate.py` | **Yes** (stage 2/3) | When to start LLM generation |
+| 4 | Causal LLM | `src/llm/qwen.py` | **Frozen** | Text generation (Qwen3-8B) |
 
-**Current LLM**: Qwen3-8B. The system is LLM-agnostic by design — swapping requires only a dimension change in the output projection.
+**Window geometry (training and inference):** 0.8 s window, 0.4 s stride (50% overlap) @ 16 kHz → 12 800 samples per chunk, new window every 0.4 s.
 
----
+**Whisper canvas:** Each chunk is mel-padded to 3000 frames (30 s). The encoder always outputs **T = 1500** frames per chunk. **No post-encode trimming** is applied — short windows still produce `(1, 1500, 768)`.
 
-## 4. Streaming Pipeline
-
-```
-Window params: 0.8s window / 0.4s stride (50% overlap)
-Target rate:   1–3 tokens/window → ~1–3 tokens/sec
-```
-
-Per window, the pipeline executes:
-
-1. Raw audio is split into overlapping windows (0.8s, stride 0.4s)
-2. Frozen Whisper encoder → frame features F ∈ R^{T × D_enc} (T ≈ 40 for 0.8s, D_enc = 768 for Whisper-small)
-3. Trainable adapter compresses each window → m tokens (1–4 per window, optionally adaptive)
-4. Tokens appended to LLM context via KV-cache (no re-encoding)
-5. Early-commit gate polls accumulated tokens → triggers LLM generation when confident
-6. LLM generates early and continues updating as more tokens arrive
-
-**Data flow (full resolution):**
-
-```
-Raw Audio (16 kHz waveform)
-  ↓  [0.8s windows, 0.4s stride]
-Audio Window (12 800 samples)
-  ↓  [Component 1: Frozen Whisper-small encoder]
-Frame Features F ∈ R^{T × 768}
-  ↓  [Component 2: Streaming Adapter]
-  │   Q-Former layers (self-attn + cross-attn + FFN)
-  │   Optional rate controller (soft gating at train / hard at inference)
-  │   Output projection (768 → 4096 for Qwen3-8B)
-  │   Stability buffer (EMA smoothing, α ≈ 0.8)
-Compressed Tokens Z ∈ R^{m × 4096}   (m = 1–4, optionally adaptive)
-  ↓  [Component 3: Early-Commit Gate]
-  │   Commit probability g_t = σ(MLP(mean_pool(Z_{1:t})))
-  ↓  [Component 4: Frozen Qwen3-8B]
-  │   Append Z to KV-cache
-  │   Incremental generation
-Streaming Output (text tokens)
-```
+**Current LLM:** Qwen3-8B (`D_llm = 4096`). Swapping LLMs requires only changing the adapter output projection.
 
 ---
 
-## 5. Component 2: Streaming Adapter Network
+## 4. Complete Inference Pipeline
+
+Two inference paths exist. Both share the same per-window encode → adapter steps; they differ in how tokens reach the LLM.
+
+### 4.1 Shared per-window path (Components 1–3)
+
+Every 0.4 s hop (one overlapping window):
+
+```
+Live / file audio (16 kHz mono)
+  │
+  ▼
+AudioWaveformWindowizer                    src/adapter/windowing.py
+  │  slice 0.8 s chunk (12 800 samples)
+  ▼
+encode_waveform_to_hidden()                src/encoder/whisper_encoder.py
+  │  mel → pad to 3000 frames (30 s canvas)
+  │  Whisper-small encoder (frozen)
+  │  output: F ∈ R^{1500 × 768}            no trimming
+  ▼
+StreamingAdapter.forward_window()          src/adapter/streaming_adapter.py
+  │  learnable queries Q ∈ R^{m × 768}     m = 4 (num_queries)
+  │  Q-Former × 2 (self-attn + cross-attn + FFN)
+  │  optional AdaptiveRateController       stage 2+; hard gate at inference
+  │  output_proj: 768 → 4096
+  │  StabilityBuffer (EMA, α ≈ 0.8)
+  │  output: Z_t ∈ R^{m × 4096}            typically (1, 4, 4096)
+  ▼
+Append Z_t to accumulated sequence Z_{1:t}
+  │
+  ▼
+TurnEndCommitGate                          src/adapter/turn_end_commit_gate.py
+  │  SilenceTracker on Z_t (token activity)
+  │  attention-pool + classifier on Z_{1:t}
+  │  commit_prob, should_commit
+  ▼
+(branch on path below)
+```
+
+**Rate controller (optional, stage 2+):** scales or zeroes query slots per window based on complexity. Does not remove slots from the tensor — inactive slots become zeros.
+
+**Gate rule (default):** `should_commit = (commit_prob > τ) AND silence_ready`.
+
+### 4.2 Streaming inference (target path)
+
+**Classes:** `WhisperAdapterLLMCommitGatePipeline.generate_streaming()`, `WhisperAdapterStreamingSession` (`src/adapter_llm_streaming.py`), `LlmKvCacheSession` (`src/llm/kv_cache.py`).
+
+```
+For each window t = 0, 1, 2, …
+  │
+  ├─ Steps 1–3 above (encode → adapter → gate on Z_{1:t})
+  │
+  ├─ LlmKvCacheSession.append_embeddings(Z_t)
+  │     incrementally extend Qwen3-8B KV-cache (no re-encoding prior windows)
+  │
+  └─ if should_commit:
+        generate from cache → stream text tokens
+        (stop consuming audio for this turn)
+     else:
+        wait for next window
+
+End of audio (no commit):
+  optional finalize() → generate from cache
+```
+
+**Prompt modes:**
+
+| Mode | LLM prefix | When |
+|------|------------|------|
+| `train_style_asr=True` | audio tokens only | Stage 1–2 ASR eval |
+| Chat prompt | `[prompt_embeds \| Z_{1:t}]` | Stage 3 / summarization |
+
+**Demo:** `examples/streaming_demo.py`
+
+### 4.3 Batch inference (legacy path)
+
+**Classes:** `WhisperAdapterLLMPipeline.generate()`, `WhisperAdapterLLMCommitGatePipeline.generate()`.
+
+```
+Full waveform
+  │
+  ▼
+Windowize all chunks upfront
+  │
+  ▼
+Whisper encode each chunk → list of (1, 1500, 768)
+  │
+  ▼
+Adapter over all windows (forward or forward_window loop)
+  │
+  ▼
+Concatenate all Z_t → (1, num_windows × m, 4096)
+  │
+  ├─ [Commit-gate pipeline] gate diagnostics per window;
+  │    optional early window truncation (does not use KV-cache streaming)
+  │
+  ▼
+Single model.generate() on full prefix
+  │
+  ▼
+Text output
+```
+
+**Difference from §4.2:** all windows are processed first; the LLM receives one batched prefix and decodes once. Gate records probabilities but does not trigger incremental decode.
+
+### 4.4 Inference checklist by checkpoint
+
+| Checkpoint | Pipeline class | Method | Rate ctrl | Gate |
+|------------|----------------|--------|-----------|------|
+| Stage 1 | `WhisperAdapterLLMPipeline` | `generate(train_style_asr=True)` | Off | Off |
+| Stage 2 | `WhisperAdapterLLMCommitGatePipeline` | `generate_streaming()` or `generate()` | On | On |
+| Stage 3 | `WhisperAdapterLLMCommitGatePipeline` | `generate_streaming(prompt=…)` | On | On |
+
+---
+
+## 5. Complete Training Pipeline
+
+Only the **adapter** (all stages) and **turn-end gate** (stages 2–3) receive gradients. Whisper and Qwen remain frozen.
+
+### 5.1 Shared per-utterance window loop (all stages)
+
+LibriSpeech (or Smart Turn) utterance:
+
+```
+audio file → load_mono_waveform_16k()
+  │
+  ▼
+AudioWaveformWindowizer (0.8 s / 0.4 s)
+  │
+  ▼
+for each window chunk:
+  │
+  ├─ Whisper encode (frozen)              → (1, 1500, 768)
+  ├─ adapter.forward_window(F)            → Z_t ∈ (1, 4, 4096)   [gradients]
+  ├─ optional rate controller             → L_sparse, L_rate      [stage 2/3]
+  ├─ StabilityBuffer                      → L_stability
+  └─ append Z_t to Z_{1:t}
+  │
+  ▼
+utterance tokens: concat all Z_t → (1, T_utt, 4096)
+  where T_utt = num_windows × 4
+```
+
+**Trainers:** `WhisperWindowFeatureExtractor` / `encode_waveform_to_hidden` + `forward_window` (same geometry as inference).
+
+### 5.2 Stage 1 — Contrastive alignment
+
+**Script:** `training/adapter_contrastive_trainer.py`  
+**Trains:** adapter only | **Rate controller:** off | **Gate:** off | **LLM CE:** off
+
+```
+Per batch of utterances:
+  │
+  ├─ For each utterance: window loop → Z_{1:T}
+  ├─ Pad batch → audio_tokens (B, T_max, 4096)
+  │
+  ├─ Transcript → tokenizer → frozen Qwen embedder → label_embeds
+  │
+  ├─ L_align = InfoNCE(mean_pool(Z), mean_pool(label_embeds))
+  │            with batch-centering fix (see §9.2)
+  │
+  └─ L_stability = mean of per-window stability losses
+
+L = L_align + λ_stability · L_stability
+```
+
+**Checkpoint:** `checkpoints/adapter_stage1.pt`
+
+### 5.3 Stage 2 — ASR distillation
+
+**Script:** `training/adapter_asr_trainer.py`  
+**Trains:** adapter + `TurnEndCommitGate` | **Rate controller:** on (target ~2 tokens/window)
+
+```
+Per utterance:
+  │
+  ├─ Window loop:
+  │     forward_window → Z_t
+  │     gate(Z_{1:t}, t, T) → L_gate (BCE; synthetic or Smart Turn labels)
+  │
+  ├─ Stack all audio tokens
+  │
+  ├─ Frozen Qwen teacher forcing:
+  │     inputs_embeds = [audio_tokens | im_end/BOS | transcript_embeds]
+  │     labels: -100 on audio/BOS positions, transcript tokens on text
+  │     → L_asr (cross-entropy)
+  │
+  ├─ L_align (contrastive, weighted)
+  ├─ L_stability, L_sparse, L_rate (from adapter + rate controller)
+  │
+  └─ L = L_asr + λ_align·L_align + λ_stability·L_stability
+            + λ_sparse·L_sparse + λ_rate·L_rate + λ_gate·L_gate
+```
+
+**Inference note:** stage 2 eval uses `audio_tokens → generate` without appending im_end (Qwen3 treats im_end as chat mode).
+
+**Checkpoint:** `checkpoints/adapter_stage2.pt` (includes `gate_state_dict`)
+
+### 5.4 Stage 3 — Task distillation
+
+**Script:** `training/adapter_task_trainer.py`  
+**Trains:** adapter + gate | **Teacher & student:** both frozen Qwen3-8B
+
+```
+Per utterance:
+  │
+  ├─ Teacher (text-only, frozen):
+  │     prompt + generate → teacher logits
+  │
+  ├─ Window loop (same as stage 2):
+  │     adapter → Z_t, gate → L_gate
+  │     at commit points: student forward on [Z_{1:t} | BOS]
+  │
+  ├─ L_task = KL(student_logits ∥ teacher_logits)
+  ├─ L_asr, L_stability, L_rate, L_gate (optional weights)
+  ├─ prefix consistency: P(y|Z_{1:t}) ≈ P(y|Z_{1:t+k})
+  └─ revision penalty on contradicting earlier tokens
+
+L = L_task + λ_asr·L_asr + λ_stability·L_stability + λ_rate·L_rate
+      + λ_gate·L_gate + λ_prefix·L_prefix + λ_revision·L_revision
+```
+
+**Target inference:** chat prompt + audio tokens (`--prompt-asr` path).
+
+### 5.5 Training vs inference
+
+| Aspect | Training | Inference (streaming) |
+|--------|----------|------------------------|
+| Audio scope | Full utterance, all windows | Chunk-by-chunk over time |
+| Whisper output | `(1, 1500, 768)` per window, no trim | Same |
+| Adapter | Gradients on; EMA state updated | Eval; EMA carried across windows |
+| Rate controller | Soft gating + losses | Hard zero inactive slots |
+| Gate | L_gate BCE | `should_commit` triggers decode |
+| LLM | Frozen; CE or KL for loss only | KV-cache append + `generate` |
+| Token delivery | Concat all windows, one LM forward | Incremental append per window |
+
+---
+
+## 6. Component 2: Streaming Adapter Network
 
 **Implementation**: `src/adapter/streaming_adapter.py`
 
@@ -119,7 +329,8 @@ Each layer (`src/adapter/cross_attention.py::QFormerLayer`) has three sub-layers
 |--------|---------|
 | Average pooling | Destroys temporal order — "hello world" = "world hello" |
 | Strided CNN | Rigid, content-independent — silence gets same weight as phonemes |
-| Q-Former (chosen) | Content-adaptive; queries specialize via self-attention; decoupled from input length |
+| Q-Former (chosen) | Content-adaptive; queries specialize via
+ self-attention; decoupled from input length |
 
 ### Cross-Attention Layer Placement
 
@@ -160,47 +371,141 @@ Inference uses hard thresholding; training uses soft gating.
 
 ---
 
-## 6. Component 3: Early-Commit Gate
+## 7. Component 3: Turn-End Commit Gate
 
-**Implementation**: `src/adapter/early_commit_gate.py`
+**Implementation**: `src/adapter/turn_end_commit_gate.py`  
+**Detailed design**: [`docs/EARLY_COMMIT.md`](EARLY_COMMIT.md)
+
+### 7.1 VAD vs Turn Detection
+
+These are often confused because both affect *when the agent speaks*, but they answer
+**different questions** at **different levels**.
+
+| | VAD (Voice Activity Detection) | Turn detection (e.g. Smart Turn) |
+|---|---|---|
+| **Question** | Is there **speech** or **silence** right now? | Has the user **finished their turn** (or will they continue)? |
+| **Input** | Raw audio (energy, lightweight ML) | Raw audio or encoded tokens (prosody, phrasing, context) |
+| **Output** | Speech / non-speech | Turn **complete** vs **incomplete** |
+| **Typical model** | Silero VAD | Smart Turn V3, our `TurnEndCommitGate` |
+| **When it runs** | Continuously, cheap | After a candidate pause (often post-VAD) or every streaming window |
+| **Knows content?** | No — silence after any speech looks the same | Yes — distinguishes real turn ends from backchannels and mid-thought pauses |
+
+**VAD** segments the waveform into “someone is talking” vs “nobody is talking.” It does
+not know *why* there is silence or whether the user is done.
+
+**Turn detection** decides whether the conversational floor has changed — i.e. whether
+the agent should **take a turn** and start responding.
+
+#### Example: why VAD alone is not enough
+
+Agent is explaining something; the user listens and backchannels:
+
+```
+Agent:  "...and that's why we use streaming windows."
+User:   "ok"          ← short ack, still listening
+        [silence]
+```
+
+| Stage | VAD says | Turn detection says | Agent should respond? |
+|---|---|---|---|
+| After user says "ok" | Silence detected | **Incomplete** — backchannel, not a handoff | **No** — keep listening |
+| User finishes a real question | Silence detected | **Complete** — turn ended | **Yes** — generate |
+
+Smart Turn’s training data explicitly includes **midfiller** / **endfiller** clips
+(short utterances like “ok”, “yes”, “mm-hmm”) labeled complete vs incomplete so the model
+learns not to treat every pause as turn-end.
+
+#### Where our pipeline fits
+
+```
+Audio stream
+  ↓  [Whisper + Adapter]        ← runs while user speaks; prefills LLM KV-cache
+  ↓  [TurnEndCommitGate]        ← turn detection on adapter tokens Z_{1:t}
+  ↓  should_commit → LLM generate
+```
+
+- **`TurnEndCommitGate`** combines turn detection + token-based silence tracking (no separate VAD model)
+- To reject unwanted commits on “ok / yes / uh-huh”, train the gate on **Smart Turn**
+  `endpoint_bool` labels (`GATE_LABEL_SOURCE=smart_turn`). Synthetic LibriSpeech labels
+  (last window = complete) do not teach backchannel behavior.
+
+See [`EARLY_COMMIT.md`](EARLY_COMMIT.md) for training modes and checkpoint notes.
+
+#### Combining VAD + turn detection
+
+VAD and turn detection are **complementary** — the gate combines both:
+
+| Layer | Mechanism | Blocks commit when… |
+|---|---|---|
+| **Silence (VAD)** | :class:`SilenceTracker` — token activity from ``Z_t`` | User is **actively speaking** (low token activity window) |
+| **Turn-end** | Smart Turn-style head on `Z_{1:t}` | Pause is a **backchannel** ("ok", "yes") not a handoff |
+
+**Inference rule** (when ``require_silence_for_commit=True``, default):
+
+```python
+should_commit = (commit_prob > threshold) AND silence_tracker.silence_ready
+```
+
+``silence_ready`` means: not in speech **and** trailing silence ≥ ``min_silence_ms`` (default 200 ms).
+
+**Classifier joint input** — silence features are concatenated with pooled adapter tokens:
+
+```python
+silence_features = [silence_indicator, silence_duration_norm, activity_prob]  # dim=3
+logit = classifier(concat(attention_pool(Z_{1:t}), silence_features))
+```
+
+Use ``SilenceTracker.update_from_window_tokens(window_tokens=Z_t)`` each step, or
+``gate.make_silence_tracker()``.
+
+Env: ``GATE_MIN_SILENCE_MS``, ``GATE_REQUIRE_SILENCE``, ``GATE_TOKEN_ACTIVITY_THRESHOLD``.
 
 > **This is NOT the rate controller.** They solve different problems.
 
-| | Rate Controller | Early-Commit Gate |
+| | Rate Controller | Turn-End Commit Gate |
 |---|---|---|
-| Question | "How many tokens for THIS window?" | "Should the LLM START generating?" |
+| Question | "How many tokens for THIS window?" | "Has the user stopped speaking → start LLM?" |
 | Scope | Per-window | Per-stream |
 | Part of | Component 2 (adapter, optional) | Component 3 (separate module) |
-| Loss | L_sparse + L_rate | L_gate |
+| Loss | L_sparse + L_rate | L_gate (BCE + optional latency) |
+| Replaces | — | Separate VAD + turn detection (e.g. SmartTurn) |
 
-The gate operates on accumulated tokens Z_{1:t}:
+The gate operates on accumulated adapter tokens `Z_{1:t}` **plus silence features**
+from :class:`SilenceTracker` using a **Smart Turn-style** attention pool + classifier:
 
 ```python
-g_t = σ(MLP(mean_pool(Z_{1:t})))   # commit probability ∈ [0, 1]
+# Attention pool over token positions (Smart Turn V3 pattern on adapter tokens)
+weights = softmax(MLP(Z_{1:t}), dim=1)
+pooled = sum(Z_{1:t} * weights, dim=1)
+silence = SilenceTracker.features()   # [silence_indicator, silence_duration_norm, activity_prob]
+g_t = σ(classifier(concat(pooled, silence)))   # turn-end probability ∈ [0, 1]
+should_commit = (g_t > threshold) AND silence_tracker.silence_ready   # when enabled
 ```
 
-**L_gate** balances two opposing penalties:
+**Unified pipeline latency win**: Whisper encoder + adapter run **while the user speaks**,
+appending tokens to the LLM KV-cache. When `should_commit` fires, only gate inference +
+LLM decode remain — no separate encode-at-turn-end step.
 
-- **Accuracy penalty**: Committing before enough context → poor LLM output
-- **Latency penalty**: Committing late → unnecessarily high first-token latency
+**L_gate**:
+
+- **Primary**: BCE on turn-end labels (`endpoint_bool` from Smart Turn, or synthetic
+  last-window labels on LibriSpeech)
+- **Optional latency penalty** (Stage 3 streaming tradeoffs):
 
 ```python
-# Latency penalty component (from early_commit_gate.py)
-position = timestep / max(total_timesteps - 1, 1)   # normalised ∈ [0, 1]
+position = timestep / max(total_timesteps - 1, 1)
 latency_penalty = latency_weight * position * (1.0 - commit_prob).mean()
+gate_loss = bce_loss + latency_penalty
 ```
 
-Full `L_gate` requires the task loss to backpropagate through the gate so that committing too early also produces a task-accuracy penalty.
+> **Previous design (reference only)**: mean-pool MLP gate in `src/adapter/early_commit_gate.py`
+> (commented out). See migration notes in [`EARLY_COMMIT.md`](EARLY_COMMIT.md).
 
 ---
 
-## 7. Loss Functions by Training Stage
+## 8. Loss Functions by Training Stage
 
-### Training Pipeline Overview
-
-![Training Flow](assets/training_flow.png)
-
-### Complete Loss Inventory
+### Loss inventory
 
 | Loss | Stage introduced | What it does |
 |------|-----------------|-------------|
@@ -209,7 +514,7 @@ Full `L_gate` requires the task loss to backpropagate through the gate so that c
 | `L_asr` | Stage 2 | Frozen causal LM loss with teacher-forced text |
 | `L_sparse` | Stage 2 | L1 on rate controller gates — fewer tokens when possible |
 | `L_rate` | Stage 2 | MSE between effective token count and target rate R |
-| `L_gate` | Stage 3 | Latency–accuracy tradeoff for early-commit gate |
+| `L_gate` | Stage 2/3 | Turn-end BCE (+ optional latency penalty) for commit gate |
 | `L_task` | Stage 3 | KL divergence from teacher LLM distribution |
 | Prefix consistency | Stage 3 | P(y \| Z_{1:t}) ≈ P(y \| Z_{1:t+k}) |
 | Revision penalty | Stage 3 | Penalise changing earlier generated output |
@@ -218,7 +523,7 @@ Full `L_gate` requires the task loss to backpropagate through the gate so that c
 
 ---
 
-## 8. Stage 1: Contrastive Audio–Text Alignment
+## 9. Stage 1: Contrastive Audio–Text Alignment
 
 **Status: Completed.**
 
@@ -232,28 +537,27 @@ L = L_align + λ_stability · L_stability
 
 **Inputs**: LibriSpeech `(audio_path, transcription)` pairs.
 
-**Core forward pass**:
+**Core forward pass** (see §5.2 for full training flow):
 
 ```
 waveform
-  → WhisperWindowFeatureExtractor (0.8s / 0.4s segments)
-  → StreamingAdapter.forward_window() per segment
-  → concatenate tokens across segments
+  → AudioWaveformWindowizer (0.8s / 0.4s)
+  → Whisper encode per chunk → (1, 1500, 768) per window
+  → StreamingAdapter.forward_window() per window → Z_t (1, 4, 4096)
+  → concatenate Z_{1:T}
   → mean pool → (batch-center) → L2-normalize → audio_vec
 
 transcription
-  → tokenizer
-  → LLM embedding layer only (frozen)
-  → mean pool → (batch-center) → L2-normalize → text_vec
+  → tokenizer → frozen Qwen embedder → mean pool → (batch-center) → L2-normalize → text_vec
 
 L_align = InfoNCE(audio_vec, text_vec)
 ```
 
-**Checkpoint**: `checkpoints/adapter_adapter.pt`
+**Checkpoint:** `checkpoints/adapter_stage1.pt`
 
 ---
 
-### 8.1 The Cone Collapse Problem
+### 9.1 The Cone Collapse Problem
 
 During initial Stage 1 training, the contrastive loss was not learning. Diagnostics showed:
 
@@ -298,7 +602,7 @@ This is a well-documented property of transformer LM embeddings:
 
 ---
 
-### 8.2 The Fix: Batch Centering
+### 9.2 The Fix: Batch Centering
 
 **Four lines of code. Zero new parameters.**
 
@@ -338,11 +642,11 @@ t = F.normalize(t_pooled, dim=-1)
 
 ---
 
-## 9. Stage 2: Content Preservation (ASR Distillation)
+## 10. Stage 2: Content Preservation (ASR Distillation)
 
-**Status: Not yet started.**
+**Status:** Training scripts and checkpoints available (`checkpoints/adapter_stage2.pt`). See §5.3 for the full pipeline.
 
-**Goal**: Make adapter tokens sufficient for accurate ASR when fed into the frozen LLM. Adds ASR distillation on top of the Stage 1 alignment objective.
+**Goal:** Make adapter tokens sufficient for accurate ASR when fed into the frozen LLM. Adds ASR distillation on top of the Stage 1 alignment objective.
 
 **Loss**:
 
@@ -353,15 +657,15 @@ L = L_asr + λ_align · L_align + λ_stability · L_stability + λ_sparse · L_s
 **New in Stage 2**:
 - `L_asr`: Frozen causal LM loss. Audio tokens are prepended to the LLM context; the LLM predicts the correct transcript in teacher-forced mode. Gradients flow back through the adapter only (LLM stays frozen).
 - Optional `AdaptiveRateController` introduced for token efficiency (`L_sparse`).
-- `EarlyCommitGate` trained jointly (gate loss contribution is small; primary focus is content fidelity).
+- `TurnEndCommitGate` trained jointly (gate loss contribution is small; primary focus is content fidelity).
 
 ---
 
-## 10. Stage 3: Task Distillation (Streaming)
+## 11. Stage 3: Task Distillation (Streaming)
 
-**Status: Not yet started.**
+**Status:** Trainer implemented (`training/adapter_task_trainer.py`); depends on stage 2 checkpoint. See §5.4 for the full pipeline.
 
-**Goal**: Full streaming training with early commitment. Distil knowledge from a frozen text-only teacher LLM into the streaming audio system.
+**Goal:** Full streaming training with early commitment. Distil knowledge from a frozen text-only teacher LLM into the streaming audio system.
 
 **Loss**:
 
@@ -373,11 +677,11 @@ L = L_task + λ_asr · L_asr + λ_stability · L_stability + λ_rate · L_rate +
 - `L_task`: KL divergence between the audio-conditioned LLM distribution and the teacher text-only LLM distribution.
 - Prefix consistency: P(y | Z_{1:t}) ≈ P(y | Z_{1:t+k}) — earlier predictions should not change as more audio arrives.
 - Revision penalty: Penalises the LLM for retracting or contradicting earlier generated tokens.
-- `EarlyCommitGate` is trained to full effect with the task loss backpropagating through the commit decision.
+- `TurnEndCommitGate` is trained to full effect with the task loss backpropagating through the commit decision.
 
 ---
 
-## 11. Evaluation Strategy
+## 12. Evaluation Strategy
 
 We evaluate on **three axes** to separately measure what the adapter has learned:
 
@@ -413,7 +717,7 @@ Generate transcript end-to-end (audio → adapter tokens → LLM → text). Comp
 
 ---
 
-## 12. Baseline: SALMONN-7B
+## 13. Baseline: SALMONN-7B
 
 We use [SALMONN-7B](https://github.com/bytedance/SALMONN) as our primary baseline for LibriSpeech test-clean evaluation.
 
@@ -427,13 +731,13 @@ SALMONN architecture:
 
 SALMONN's Q-Former input dimension is `Whisper_d_model + BEATs_encoder_embed_dim` (see `model.py::init_speech_Qformer`). This dual-encoder design is intended to give the model complementary representations: Whisper captures fine-grained phonetic/prosodic structure, while BEATs captures event-level acoustic features useful for non-speech audio tasks.
 
-### 12.1 What SALMONN Does Well
+### 13.1 What SALMONN Does Well
 
 SALMONN was designed for audio question-answering, not streaming retrieval. Given an audio clip and a prompt, it produces semantically correct, contextually appropriate text responses. Its LLM is a full Vicuna model with strong language understanding, and its Q-Former effectively bridges Whisper + BEATs and Vicuna for content-level tasks.
 
 The dual-encoder input (Whisper + BEATs) is a key strength for general audio tasks — BEATs was pretrained on AudioSet with a masked audio modelling objective and provides rich non-speech representations that Whisper alone misses (e.g. environmental sounds, music, speaker emotion).
 
-### 12.2 Why Cosine Retrieval is Misleading for SALMONN
+### 13.2 Why Cosine Retrieval is Misleading for SALMONN
 
 SALMONN uses two separate representation spaces:
 - **Audio side**: speech_llama_proj(QFormer(audio)) → Vicuna hidden space
@@ -443,7 +747,7 @@ Despite sharing the LLM embedding dimension, these two representations are **not
 
 **Expected behaviour on cosine retrieval**: Low R@1 even if SALMONN correctly understands the audio content. This is not a failure of the model — it is a measurement artefact from using the wrong retrieval mode.
 
-### 12.3 Evaluation Script
+### 13.3 Evaluation Script
 
 `eval_librispeech_full_metrics.py` runs both retrieval modes and full ASR in one pass:
 
@@ -477,7 +781,7 @@ CUDA_VISIBLE_DEVICES=0,1 python eval_librispeech_full_metrics.py \
 
 ---
 
-## 13. Our System vs. SALMONN Baseline
+## 14. Our System vs. SALMONN Baseline
 
 The key architectural and methodological differences:
 
@@ -543,7 +847,7 @@ We are evaluating smaller LLMs (e.g. Phi, Qwen3-4B) for further latency reductio
 
 ---
 
-## 14. Key Differences Summary
+## 15. Key Differences Summary
 
 | Dimension | SALMONN (baseline) | Our System |
 |-----------|-------------------|------------|
@@ -563,11 +867,11 @@ We are evaluating smaller LLMs (e.g. Phi, Qwen3-4B) for further latency reductio
 
 ---
 
-## 15. Theoretical Foundation
+## 16. Theoretical Foundation
 
 **Information Bottleneck**: The adapter minimises `I(Audio; Tokens)` while maximising `I(Tokens; Task)` — compress aggressively but preserve task-relevant information.
 
-**Compression ratio**: 25× reduction (T frames → m tokens; e.g. ~50 Whisper frames → 2 adapter tokens per 0.8s window).
+**Compression ratio**: per window, 1500 encoder frames → m adapter tokens (m = 4 default, or fewer active slots with rate controller). Overlapping windows reuse audio context at 0.4 s stride.
 
 **Prefix Consistency**: `P(y | Z_{1:t}) ≈ P(y | Z_{1:t+k})` — LLM predictions should not flip as new audio tokens arrive.
 
@@ -575,7 +879,7 @@ We are evaluating smaller LLMs (e.g. Phi, Qwen3-4B) for further latency reductio
 
 ---
 
-## 16. Related Work
+## 17. Related Work
 
 | System | Relationship |
 |--------|-------------|
@@ -588,15 +892,15 @@ We are evaluating smaller LLMs (e.g. Phi, Qwen3-4B) for further latency reductio
 
 ---
 
-## 17. Current Status
+## 18. Current Status
 
 | Stage | Status | Notes |
 |-------|--------|-------|
-| Stage 1: Contrastive alignment | **Completed** | Centering fix applied; contrastive signal confirmed learning |
+| Stage 1: Contrastive alignment | **Completed** | Centering fix applied; `checkpoints/adapter_stage1.pt` |
 | Stage 1 evaluation | **In progress** | Cosine retrieval on LibriSpeech test-clean |
-| SALMONN baseline eval | **In progress** | Running `eval_librispeech_full_metrics.py` — NLL retrieval + ASR (WER/BLEU) on LibriSpeech test-clean |
-| Stage 2: ASR distillation | Not started | Depends on Stage 1 eval results |
-| Stage 3: Task distillation | Not started | Depends on Stage 2 |
+| Stage 2: ASR distillation | **Checkpoints available** | `adapter_stage2.pt`; streaming inference via `generate_streaming()` |
+| Stage 3: Task distillation | **Trainer ready** | `adapter_task_trainer.py` |
+| SALMONN baseline eval | **In progress** | `eval_librispeech_full_metrics.py` |
 
 ### Planned Evaluation Protocol
 

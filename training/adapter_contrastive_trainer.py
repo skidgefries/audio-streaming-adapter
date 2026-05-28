@@ -9,9 +9,10 @@ Loss: L = L_align + λ_stability · L_stability
 
 import os
 import sys
+from contextlib import nullcontext
+
 import torch
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler
 
 _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _src_root = os.path.join(_pkg_root, "src")
@@ -31,7 +32,7 @@ if _hf_token:
 
 from src.adapter.streaming_adapter import StreamingAdapter
 from src.dataset import LibriSpeechConfig, load_mono_waveform_16k, LibriSpeechPairsCustom, LibriSpeechPairs
-from src.encoder import WhisperWindowFeatureExtractor
+from src.encoder.waveform_window_encoder import WhisperWindowFeatureExtractor
 from training.utils.checkpointing import (
     TrainingCheckpoint,
     maybe_upload_stage_epoch_checkpoint,
@@ -43,15 +44,27 @@ from training.utils.config import (
     HfCheckpointConfig,
     OptimConfig,
     Stage1Config,
+    DeviceConfig,
     WandbConfig,
 )
 from training.utils.logging import WandbLogger
 from training.utils.losses import contrastive_infonce_loss
 from training.utils.metrics import RunningMean
-from training.utils.loaders import default_device_and_dtype, load_frozen_qwen_embeddings
+from training.utils.loaders import load_frozen_qwen_embeddings
 
 # Configuration
-DEVICE, TORCH_DTYPE = default_device_and_dtype()
+DEVICE_CFG = DeviceConfig.from_env()
+if DEVICE_CFG.device == "cpu" or not torch.cuda.is_available():
+    DEVICE, TORCH_DTYPE = "cpu", torch.float32
+else:
+    DEVICE = "cuda:0" if DEVICE_CFG.device == "cuda" else DEVICE_CFG.device
+    TORCH_DTYPE = torch.bfloat16
+
+
+def _maybe_autocast(device: str):
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
 # Model dimensions
 WHISPER_DIM = 768   # whisper-small
@@ -66,7 +79,7 @@ OPT = OptimConfig(lr=1e-4, weight_decay=0.01, grad_clip_norm=0.5, warmup_steps=1
 DATA = DataConfig(
     dataset_root=LibriSpeechConfig.default_train_clean_100_from_training_dir(os.path.dirname(__file__)).root,
     batch_size=16,
-    num_workers=2,
+    num_workers=4,
     max_windows_per_utt=None,
 )
 CKPT = CheckpointConfig(dir="checkpoints", save_every_epochs=1)
@@ -92,11 +105,18 @@ def _pad_tokens(utterances: list[torch.Tensor]) -> torch.Tensor:
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train():
-    torch.cuda.empty_cache()
-    print(f"Using device: {DEVICE}")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"Using device: {DEVICE} ({TORCH_DTYPE})")
     audio = WhisperWindowFeatureExtractor(model_id=WHISPER_MODEL, device=DEVICE, torch_dtype=TORCH_DTYPE)
 
-    qwen_models = load_frozen_qwen_embeddings(model_id=LLM_MODEL_ID, device=DEVICE, torch_dtype=TORCH_DTYPE, device_map="auto")
+    llm_device_map = "auto" if str(DEVICE).startswith("cuda") else None
+    qwen_models = load_frozen_qwen_embeddings(
+        model_id=LLM_MODEL_ID,
+        device=DEVICE,
+        torch_dtype=TORCH_DTYPE,
+        device_map=llm_device_map,
+    )
     llm_tokenizer = qwen_models.tokenizer
     text_embedder = qwen_models.embedder
 
@@ -112,7 +132,7 @@ def train():
         ema_alpha=0.8,
         learnable_ema=False,
         use_rate_controller=False,  # Fixed 4 tokens per window for stage 1
-    ).to(DEVICE, dtype= torch.bfloat16)
+    ).to(DEVICE, dtype=TORCH_DTYPE)
     adapter.train()
 
     print(f"StreamingAdapter initialized:")
@@ -256,14 +276,12 @@ def train():
                 print(f"  min: {label_embeds.min()}, max: {label_embeds.max()}")
                 raise ValueError("label_embeds contains NaN")
             
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with _maybe_autocast(DEVICE):
                 utterances = []
                 stab_sum = torch.zeros((), device=DEVICE, dtype=torch.float32)
                 for p in audio_paths:
                     wave = load_mono_waveform_16k(p)
                     windows = audio.waveform_to_windows(wave)
-                    if DATA.max_windows_per_utt is not None:
-                        windows = windows[: DATA.max_windows_per_utt]
                     adapter.reset_streaming_state()
                     chunks = []
                     for w in windows:
@@ -353,7 +371,7 @@ def train():
             global_step += 1
 
             # Logging
-            if step % 10 == 0:
+            if step % 1 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 print(f"Step {step:4d}/{len(dataloader)} | "
                       f"Loss: {total_loss.item():.4f} | "
@@ -378,7 +396,8 @@ def train():
                 )
 
             # Cleanup
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Save checkpoint
         print(f"\nEpoch {epoch + 1} complete:")

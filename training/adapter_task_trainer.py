@@ -1,11 +1,14 @@
 """
-Stage 3: task distillation (teacher vs student frozen LLMs), train adapter + gate.
+Stage 3: task distillation (teacher vs student frozen LLMs), train adapter + turn-end gate.
 
 Reuses `training.utils.losses`, `training.utils.optimization`, `dataset`, and Whisper window features.
 
-``L_gate`` is the early-commit gate loss (``EarlyCommitGate`` in ``adapter/early_commit_gate.py``),
+``L_gate`` is the turn-end commit gate loss (:class:`adapter.turn_end_commit_gate.TurnEndCommitGate`),
 not the adapter rate-controller gates. For inference aligned with this trainer, use
-``WhisperAdapterLLMCommitGatePipeline`` in ``adapter_llm_pipeline.py``.
+``WhisperAdapterLLMCommitGatePipeline`` in ``adapter_llm_pipeline.py``. See ``docs/EARLY_COMMIT.md``.
+
+# Previous gate import (reference):
+# from src.adapter.early_commit_gate import EarlyCommitGate
 """
 
 from __future__ import annotations
@@ -35,24 +38,32 @@ if _hf_token:
 
 from src.encoder import WhisperWindowFeatureExtractor
 from src.adapter.streaming_adapter import StreamingAdapter
-from src.adapter.early_commit_gate import EarlyCommitGate
-from src.dataset import LibriSpeechConfig, LibriSpeechPairs, load_mono_waveform_16k
+from src.adapter.turn_end_commit_gate import TurnEndCommitGate
+from src.dataset import (
+    LibriSpeechConfig,
+    LibriSpeechPairs,
+    SmartTurnGateDataset,
+    smart_turn_collate,
+)
 from src.llm import QwenConfig, load_qwen_models
 from training.utils.checkpointing import (
     TrainingCheckpoint,
     load_adapter_state_dict,
+    load_gate_state_dict_safe,
     maybe_upload_stage_epoch_checkpoint,
     save_checkpoint,
 )
 from training.utils.config import (
     CheckpointConfig,
     DataConfig,
+    GateConfig,
     HfCheckpointConfig,
     OptimConfig,
     Stage3Config,
     Stage3DeviceConfig,
     WandbConfig,
 )
+from training.utils.gate_training import endpoint_label_for_timestep, make_silence_trackers
 from training.utils.logging import WandbLogger
 from training.utils.losses import kl_distill_loss, prefix_consistency_loss, revision_penalty_loss
 from training.utils.metrics import RunningMean
@@ -66,6 +77,7 @@ STUDENT_LLM_ID = "Qwen/Qwen3-8B"
 TEACHER_LLM_ID = "Qwen/Qwen3-8B"
 
 STAGE = Stage3Config()
+GATE = GateConfig.from_env()
 DEV = Stage3DeviceConfig()
 OPT = OptimConfig(lr=3e-5, weight_decay=0.01, grad_clip_norm=1.0, warmup_steps=0)
 DATA = DataConfig(
@@ -155,18 +167,46 @@ def train() -> None:
         print(f"Loading adapter weights from {adapter_PATH}")
         adapter.load_state_dict(load_adapter_state_dict(adapter_PATH))
 
-    gate = EarlyCommitGate(
+    # gate = EarlyCommitGate(d_llm=4096, hidden_dim=256, threshold=0.5, latency_weight=0.1)
+    gate = TurnEndCommitGate(
         d_llm=4096,
-        hidden_dim=256,
-        threshold=0.5,
-        latency_weight=0.1,
+        hidden_dim=GATE.hidden_dim,
+        threshold=GATE.threshold,
+        latency_weight=GATE.latency_weight,
+        min_silence_ms=GATE.min_silence_ms,
+        require_silence_for_commit=GATE.require_silence_for_commit,
+        token_activity_threshold=GATE.token_activity_threshold,
+        window_duration_sec=GATE.window_seconds,
+        silence_mode=GATE.silence_mode,
+        active_silence_path=GATE.active_silence_path,
+        learned_silence_hidden_dim=GATE.learned_silence_hidden_dim,
     ).to(student_device, dtype=student_dtype)
     gate.train()
 
-    trainable_params = list(adapter.parameters()) + list(gate.parameters())
-    optimizer = torch.optim.SGD(trainable_params, lr=OPT.lr, weight_decay=OPT.weight_decay)
+    if os.path.isfile(adapter_PATH):
+        ckpt = torch.load(adapter_PATH, map_location=student_device)
+        if isinstance(ckpt, dict) and "gate_state_dict" in ckpt:
+            load_gate_state_dict_safe(gate, ckpt)
 
-    dataset = LibriSpeechPairs(DATA.dataset_root)
+    trainable_params = list(adapter.parameters()) + list(gate.parameters())
+    if GATE.label_source == "smart_turn":
+        for p in adapter.parameters():
+            p.requires_grad = False
+        adapter.eval()
+        trainable_params = list(gate.parameters())
+
+    dataset = (
+        SmartTurnGateDataset(
+            GATE.smart_turn_dataset,
+            split=GATE.smart_turn_split,
+            max_samples=GATE.smart_turn_max_samples,
+        )
+        if GATE.label_source == "smart_turn"
+        else LibriSpeechPairs(DATA.dataset_root)
+    )
+    collate_fn = smart_turn_collate if GATE.label_source == "smart_turn" else None
+
+    optimizer = torch.optim.SGD(trainable_params, lr=OPT.lr, weight_decay=OPT.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max(1, STAGE.epochs * max(1, len(dataset))),
@@ -174,7 +214,13 @@ def train() -> None:
     )
     pipeline = TrainingPipeline(optimizer=optimizer, scheduler=scheduler, grad_clip_norm=OPT.grad_clip_norm)
 
-    dataloader = DataLoader(dataset, batch_size=DATA.batch_size, shuffle=True, num_workers=DATA.num_workers)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=DATA.batch_size,
+        shuffle=True,
+        num_workers=DATA.num_workers,
+        collate_fn=collate_fn,
+    )
 
     os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
     logger = WandbLogger(
@@ -182,11 +228,12 @@ def train() -> None:
         project=WANDB.project,
         entity=WANDB.entity,
         run_name=WANDB.run_name,
-        config={"stage": 3, "data": DATA.__dict__, "optim": OPT.__dict__, "stage_cfg": STAGE.__dict__},
+        config={"stage": 3, "data": DATA.__dict__, "optim": OPT.__dict__, "stage_cfg": STAGE.__dict__, "gate_cfg": GATE.__dict__},
     )
 
     print("\nStarting Stage 3 training: Task Distillation")
-    print(f"  Task: {TASK_TYPE} | Epochs: {STAGE.epochs} | batch: {DATA.batch_size} | lr: {OPT.lr}\n")
+    print(f"  Task: {TASK_TYPE} | Epochs: {STAGE.epochs} | batch: {DATA.batch_size} | lr: {OPT.lr}")
+    print(f"  Gate label source: {GATE.label_source}\n")
 
     for epoch in range(STAGE.epochs):
         m_total = RunningMean()
@@ -201,15 +248,54 @@ def train() -> None:
         print(f"\n{'=' * 60}\nEpoch {epoch + 1}/{STAGE.epochs}\n{'=' * 60}\n")
 
         for step, batch in enumerate(dataloader):
-            audio_paths, transcriptions = batch
-            audio_path = audio_paths[0]
-            transcription = transcriptions[0]
+            if GATE.label_source == "smart_turn":
+                waveforms, endpoint_labels = batch
+                wave = waveforms[0].to(student_device)
+                endpoint_label = endpoint_labels[0, 0].item()
+                transcription = ""
+            else:
+                from src.dataset import load_mono_waveform_16k
 
-            wave = load_mono_waveform_16k(audio_path)
+                audio_paths, transcriptions = batch
+                audio_path = audio_paths[0]
+                transcription = transcriptions[0]
+                wave = load_mono_waveform_16k(audio_path)
+                endpoint_label = None
+
             windows = audio.waveform_to_windows(wave)
             if DATA.max_windows_per_utt is not None:
                 windows = windows[: DATA.max_windows_per_utt]
             if not windows:
+                continue
+
+            if GATE.label_source == "smart_turn":
+                adapter.reset_streaming_state()
+                silence_tracker, learned_silence_tracker = make_silence_trackers(gate)
+                all_audio_tokens = []
+                total_gate_loss = torch.zeros((), device=student_device, dtype=torch.float32)
+                with torch.no_grad():
+                    for window in windows:
+                        result = adapter.forward_window(window)
+                        all_audio_tokens.append(result["tokens"])
+                for t in range(len(all_audio_tokens)):
+                    accumulated = torch.cat(all_audio_tokens[: t + 1], dim=1)
+                    gate_result = gate(
+                        accumulated,
+                        t,
+                        len(windows),
+                        endpoint_label=endpoint_label,
+                        silence_tracker=silence_tracker,
+                        learned_silence_tracker=learned_silence_tracker,
+                        window_tokens=all_audio_tokens[t],
+                    )
+                    total_gate_loss = total_gate_loss + gate_result["gate_loss"].float()
+                gate_loss = total_gate_loss / float(len(windows))
+                total_loss = STAGE.lambda_gate * gate_loss
+                pipeline.step(total_loss, trainable_params)
+                m_gate.update(float(gate_loss.item()))
+                m_total.update(total_loss.item())
+                if step % 10 == 0:
+                    print(f"Step {step:4d} | Gate-only (smart_turn): {gate_loss.item():.4f}")
                 continue
 
             teacher_input = teacher_tokenizer(
@@ -244,6 +330,7 @@ def train() -> None:
             student_gt_ids = student_gt_tokens.input_ids
 
             adapter.reset_streaming_state()
+            silence_tracker, learned_silence_tracker = make_silence_trackers(gate)
             all_audio_tokens: list[torch.Tensor] = []
             generation_history: list[torch.Tensor] = []
             total_stability_loss = torch.zeros((), device=student_device, dtype=torch.float32)
@@ -258,7 +345,21 @@ def train() -> None:
                     total_rate_loss = total_rate_loss + result["rate_loss"].float()
 
                 accumulated = torch.cat(all_audio_tokens, dim=1)
-                gate_result = gate(accumulated, t, len(windows))
+                endpoint = endpoint_label_for_timestep(
+                    t,
+                    len(windows),
+                    batch_size=accumulated.shape[0],
+                    device=student_device,
+                )
+                gate_result = gate(
+                    accumulated,
+                    t,
+                    len(windows),
+                    endpoint_label=endpoint,
+                    silence_tracker=silence_tracker,
+                    learned_silence_tracker=learned_silence_tracker,
+                    window_tokens=result["tokens"],
+                )
                 total_gate_loss = total_gate_loss + gate_result["gate_loss"].float()
 
                 if gate_result["should_commit"].item() > 0.5 or t == len(windows) - 1:

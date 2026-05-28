@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +28,7 @@ class LlmGenerationParams:
 
     max_new_tokens: int = 100
     do_sample: bool = True
+    num_beams: int = 1
 
     # Sampling-only params (used only when do_sample=True)
     temperature: float | None = None
@@ -37,6 +37,7 @@ class LlmGenerationParams:
 
     # Common decoding params
     repetition_penalty: float | None = None
+    no_repeat_ngram_size: int | None = None
 
 
 def build_hf_generation_config(
@@ -51,33 +52,36 @@ def build_hf_generation_config(
     Important: pretrained models often ship a `generation_config.json` (e.g. temperature/top_p/top_k).
     For greedy decoding we *clear* sampling fields to avoid warnings and ambiguous behavior.
     """
-    base = getattr(model, "generation_config", None)
-    gen_cfg = copy.deepcopy(base) if base is not None else GenerationConfig()
-
-    gen_cfg.max_new_tokens = int(params.max_new_tokens)
-    gen_cfg.do_sample = bool(params.do_sample)
-
     eos_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_id is not None:
-        gen_cfg.eos_token_id = eos_id
-        gen_cfg.pad_token_id = eos_id
-
     bos_id = getattr(tokenizer, "bos_token_id", None)
+
+    cfg_kwargs: dict[str, Any] = {
+        "max_new_tokens": int(params.max_new_tokens),
+        "do_sample": bool(params.do_sample),
+    }
+    if eos_id is not None:
+        cfg_kwargs["eos_token_id"] = eos_id
+        cfg_kwargs["pad_token_id"] = eos_id
     if bos_id is not None:
-        gen_cfg.bos_token_id = bos_id
+        cfg_kwargs["bos_token_id"] = bos_id
 
     if params.do_sample:
-        # Defaults chosen to be reasonable; caller can override.
-        gen_cfg.temperature = 0.7 if params.temperature is None else float(params.temperature)
-        gen_cfg.top_p = 0.9 if params.top_p is None else float(params.top_p)
-        gen_cfg.top_k = 50 if params.top_k is None else int(params.top_k)
+        cfg_kwargs["temperature"] = (
+            0.7 if params.temperature is None else float(params.temperature)
+        )
+        cfg_kwargs["top_p"] = 0.9 if params.top_p is None else float(params.top_p)
+        cfg_kwargs["top_k"] = 50 if params.top_k is None else int(params.top_k)
     else:
-        # Clear sampling-related fields to avoid HF warnings (model configs often set these).
-        gen_cfg.temperature = None
-        gen_cfg.top_p = None
-        gen_cfg.top_k = None
+        beams = max(1, int(params.num_beams))
+        cfg_kwargs["num_beams"] = beams
+        if beams > 1:
+            cfg_kwargs["num_return_sequences"] = 1
 
     if params.repetition_penalty is not None:
-        gen_cfg.repetition_penalty = float(params.repetition_penalty)
+        cfg_kwargs["repetition_penalty"] = float(params.repetition_penalty)
+    if params.no_repeat_ngram_size is not None and int(params.no_repeat_ngram_size) > 0:
+        cfg_kwargs["no_repeat_ngram_size"] = int(params.no_repeat_ngram_size)
 
+    # Fresh config avoids inheriting sampling fields from the model's generation_config.json.
+    gen_cfg = GenerationConfig(**cfg_kwargs)
     return gen_cfg

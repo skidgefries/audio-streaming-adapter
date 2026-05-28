@@ -4,7 +4,7 @@ Streaming Adapter Network (Component 2 of 4).
 The 4 components from the research:
   1. Frozen Audio Encoder (Whisper) — not in this module
   2. Streaming Adapter Network (THIS MODULE, trainable)
-  3. Early-Commit Gate — separate module (early_commit_gate.py)
+  3. Early-Commit Gate — separate module (turn_end_commit_gate.py)
   4. Frozen LLM — not in this module
 
 Pipeline per window:

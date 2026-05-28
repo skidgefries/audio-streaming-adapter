@@ -93,11 +93,68 @@ class DataConfig:
     def from_env(cls, *, default_dataset_root: str) -> DataConfig:
         root = env_str("DATASET_ROOT") or default_dataset_root
         max_win = env_str("MAX_WINDOWS_PER_UTT")
+        max_windows_per_utt: int | None = None
+        if max_win:
+            normalized = max_win.strip().lower()
+            if normalized not in {"all", "none", "unlimited"}:
+                parsed = int(max_win)
+                max_windows_per_utt = parsed if parsed > 0 else None
         return cls(
             dataset_root=root,
             batch_size=env_int("BATCH_SIZE", 8),
             num_workers=env_int("NUM_WORKERS", 2),
-            max_windows_per_utt=int(max_win) if max_win else None,
+            max_windows_per_utt=max_windows_per_utt,
+        )
+
+
+@dataclass(frozen=True)
+class GateConfig:
+    """Turn-end commit gate (Component 3)."""
+
+    label_source: str = "synthetic"  # synthetic | smart_turn
+    smart_turn_dataset: str = "pipecat-ai/smart-turn-data-v3.2-train"
+    smart_turn_split: str = "train"
+    smart_turn_max_samples: int | None = None
+    hidden_dim: int = 256
+    threshold: float = 0.5
+    latency_weight: float = 0.1
+    min_silence_ms: float = 200.0
+    require_silence_for_commit: bool = True
+    token_activity_threshold: float = 8.0
+    window_seconds: float = 0.8
+    stride_seconds: float = 0.4
+    silence_mode: str = "rule"  # rule | learned | both
+    active_silence_path: str = "rule"  # rule | learned (when silence_mode=both)
+    learned_silence_hidden_dim: int = 64
+
+    @classmethod
+    def from_env(cls) -> GateConfig:
+        max_samples = env_optional_int("SMART_TURN_MAX_SAMPLES")
+        require_silence = env_str("GATE_REQUIRE_SILENCE", "1") or "1"
+        return cls(
+            label_source=env_str("GATE_LABEL_SOURCE", "synthetic") or "synthetic",
+            smart_turn_dataset=env_str(
+                "SMART_TURN_DATASET", "pipecat-ai/smart-turn-data-v3.2-train"
+            )
+            or "pipecat-ai/smart-turn-data-v3.2-train",
+            smart_turn_split=env_str("SMART_TURN_SPLIT", "train") or "train",
+            smart_turn_max_samples=max_samples,
+            hidden_dim=env_int("GATE_HIDDEN_DIM", 256),
+            threshold=env_float("GATE_THRESHOLD", 0.5),
+            latency_weight=env_float("GATE_LATENCY_WEIGHT", 0.1),
+            min_silence_ms=env_float("GATE_MIN_SILENCE_MS", 200.0),
+            require_silence_for_commit=require_silence.strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            ),
+            token_activity_threshold=env_float("GATE_TOKEN_ACTIVITY_THRESHOLD", 8.0),
+            window_seconds=env_float("GATE_WINDOW_SECONDS", 0.8),
+            stride_seconds=env_float("GATE_STRIDE_SECONDS", 0.4),
+            silence_mode=env_str("GATE_SILENCE_MODE", "rule") or "rule",
+            active_silence_path=env_str("GATE_ACTIVE_SILENCE_PATH", "rule") or "rule",
+            learned_silence_hidden_dim=env_int("GATE_LEARNED_SILENCE_HIDDEN_DIM", 64),
         )
 
 
@@ -215,17 +272,8 @@ class Stage3DeviceConfig:
 
 
 @dataclass(frozen=True)
-class WhisperFrameWindowingConfig:
-    """Frame-level windowing after a full Whisper encoder pass (see ``adapter.windowing`` / pipeline)."""
-
-    chunk_seconds: float = 30.0
-    window_seconds: float = 0.8
-    stride_seconds: float = 0.4
-
-
-@dataclass(frozen=True)
 class WhisperWaveformWindowingConfig:
-    """Time geometry for ``encoder.WhisperWindowFeatureExtractor`` (full Whisper encode + ``WhisperFrameWindowizer``)."""
+    """Time geometry for ``encoder.WhisperWindowFeatureExtractor`` (``AudioWaveformWindowizer`` + per-chunk encode)."""
 
     window_seconds: float = 0.8
     stride_seconds: float = 0.4
@@ -276,9 +324,6 @@ class TuningConfig:
     grad_clip_norm: float = 1.0
     whisper_windowing: WhisperWaveformWindowingConfig = field(
         default_factory=WhisperWaveformWindowingConfig
-    )
-    encoder_frame_windowing: WhisperFrameWindowingConfig = field(
-        default_factory=WhisperFrameWindowingConfig
     )
     adapter: StreamingAdapterTrainConfig = field(default_factory=StreamingAdapterTrainConfig)
     model_ids: FrozenModelIdsConfig = field(default_factory=FrozenModelIdsConfig)

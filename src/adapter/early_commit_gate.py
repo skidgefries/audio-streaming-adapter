@@ -1,4 +1,16 @@
 """
+
+DEPRECATED — preserved for reference only.
+
+The mean-pool early-commit gate has been superseded by
+:class:`adapter.turn_end_commit_gate.TurnEndCommitGate`, which uses a
+Smart Turn-style attention-pool + classifier on accumulated adapter tokens
+and serves as the integrated turn-end / VAD replacement in the unified pipeline.
+
+See ``docs/EARLY_COMMIT.md`` and ``turn_end_commit_gate.py``.
+
+-------------------------------------
+
 Early-Commit Gate (Component 3 — separate from the Streaming Adapter).
 
 Decides WHEN the LLM should start generating a response vs. keep listening

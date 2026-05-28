@@ -68,6 +68,7 @@ def check_imports():
     # Check adapter components
     adapter_components = [
         ("adapter.streaming_adapter", "StreamingAdapter"),
+        ("adapter.turn_end_commit_gate", "TurnEndCommitGate"),
         ("adapter.early_commit_gate", "EarlyCommitGate"),
         ("adapter.cross_attention", "QFormerLayer"),
         ("adapter.stability_buffer", "StabilityBuffer"),
@@ -94,9 +95,11 @@ def check_imports():
 
     try:
         from adapter_llm_pipeline import WhisperAdapterLLMCommitGatePipeline, WhisperAdapterLLMPipeline
+        from adapter_llm_streaming import WhisperAdapterStreamingSession
+        from llm.kv_cache import LlmKvCacheSession
 
-        _ = (WhisperAdapterLLMPipeline, WhisperAdapterLLMCommitGatePipeline)
-        print_status("adapter_llm_pipeline classes imported")
+        _ = (WhisperAdapterLLMPipeline, WhisperAdapterLLMCommitGatePipeline, WhisperAdapterStreamingSession, LlmKvCacheSession)
+        print_status("adapter_llm_pipeline + streaming session imported")
     except ImportError as e:
         print_status(f"adapter_llm_pipeline import failed: {e}", success=False)
         all_ok = False
@@ -130,7 +133,7 @@ def check_model_init():
         sys.path.insert(0, str(pkg_root / "src"))
         sys.path.insert(0, str(pkg_root))
         from adapter.streaming_adapter import StreamingAdapter
-        from adapter.early_commit_gate import EarlyCommitGate
+        from adapter.turn_end_commit_gate import TurnEndCommitGate
 
         # Test StreamingAdapter initialization
         adapter = StreamingAdapter(
@@ -156,14 +159,14 @@ def check_model_init():
         ).to(device, dtype=torch.float16)
         print_status("StreamingAdapter (with rate controller) initialized")
 
-        # Test EarlyCommitGate initialization
-        gate = EarlyCommitGate(
+        # Test TurnEndCommitGate initialization
+        gate = TurnEndCommitGate(
             d_llm=2560,
             hidden_dim=256,
             threshold=0.5,
             latency_weight=0.1,
         ).to(device, dtype=torch.float16)
-        print_status("EarlyCommitGate initialized")
+        print_status("TurnEndCommitGate initialized")
 
         # Test forward pass with dummy data
         batch_size = 2

@@ -15,8 +15,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Add adapter module to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from adapter.streaming_adapter import StreamingAdapter
-from adapter.windowing import WhisperFrameWindowizer
-from encoder import get_encoder_output
+from adapter.windowing import AudioWaveformWindowizer
+from dataset.librispeech import load_mono_waveform_16k
+from encoder.whisper_encoder import encode_waveform_to_hidden, load_whisper_models
 
 # Qwen model setup
 torch.cuda.empty_cache()
@@ -71,19 +72,31 @@ MAX_NEW_TOKENS = 512
 TEMPERATURE = 0.7
 DO_SAMPLE = True
 
-# Windowing configuration for streaming adapter (frame-level windows over the Whisper encoder sequence)
-# Equivalent to the old WINDOW_SIZE_FRAMES=10 / STRIDE_FRAMES=5 at 50 fps.
-_frame_windowizer = WhisperFrameWindowizer(
-    chunk_seconds=30.0,
-    window_seconds=0.2,
-    stride_seconds=0.1,
-)
+WHISPER_MODEL_ID = "openai/whisper-small"
+_whisper = load_whisper_models(model_id=WHISPER_MODEL_ID, device=DEVICE, torch_dtype=torch.float16)
+
+# Windowing: raw audio → per-chunk Whisper encode (defaults 0.2s / 0.1s stride)
+WINDOW_SECONDS = 0.2
+STRIDE_SECONDS = 0.1
 
 
-def split_into_windows(encoder_output: torch.Tensor) -> list[torch.Tensor]:
-    """Convert encoder output (1, T, D) to list of (1, W, D) windows."""
-    windows = _frame_windowizer(encoder_output)  # (1, N, W, D)
-    return [windows[0, i].unsqueeze(0) for i in range(windows.shape[1])]
+def waveform_to_adapter_windows(waveform: torch.Tensor) -> list[torch.Tensor]:
+    """Raw audio windows → Whisper encode each chunk → list of ``(1, T, D)`` on DEVICE."""
+    windowizer = AudioWaveformWindowizer(
+        window_seconds=WINDOW_SECONDS,
+        stride_seconds=STRIDE_SECONDS,
+    )
+    enc_windows: list[torch.Tensor] = []
+    for chunk in windowizer(waveform):
+        enc = encode_waveform_to_hidden(
+            chunk,
+            whisper_processor=_whisper.processor,
+            whisper_model=_whisper.model,
+            device=DEVICE,
+            torch_dtype=torch.float16,
+        )
+        enc_windows.append(enc.to(DEVICE, dtype=torch.float16))
+    return enc_windows
 
 
 def qwen_summarize_single_file(file_path: str) -> dict[str, str]:
@@ -103,18 +116,15 @@ def qwen_summarize_single_file(file_path: str) -> dict[str, str]:
             num_tokens: total number of compressed tokens
     """
     try:
-        # Step 1: Get Whisper encoder output
+        # Step 1: Load waveform and build per-window Whisper encoder inputs
         print(f"⟳ Encoding: {file_path}")
-        encoder_output = get_encoder_output(file_path)  # (1, 1500, 768)
-        print(f"  ✓ Shape: {encoder_output.shape}")
+        wave = load_mono_waveform_16k(file_path)
+        windows = waveform_to_adapter_windows(wave)
+        if not windows:
+            raise ValueError("Audio shorter than one window; no adapter windows produced.")
+        print(f"  ✓ {len(windows)} windows (Whisper encode per chunk, no 30s pad)")
 
-        # Step 2: Convert to float16 and move to device
-        encoder_output = encoder_output.to(DEVICE, dtype=torch.float16)
-
-        # Step 3: Split into overlapping windows for streaming
-        windows = split_into_windows(encoder_output)
-
-        # Step 4: Process windows through StreamingAdapter
+        # Step 2: Process windows through StreamingAdapter
         print(f"  ⟳ Processing through StreamingAdapter...")
         streaming_adapter.reset_streaming_state()
 
@@ -126,10 +136,10 @@ def qwen_summarize_single_file(file_path: str) -> dict[str, str]:
         num_tokens = compressed_tokens.shape[1]
 
         print(f"  ✓ Compressed to {num_tokens} tokens from {num_windows} windows")
-        compression_ratio = (1500 * 768) / num_tokens if num_tokens > 0 else 0
-        overlap_percent = (WINDOW_SIZE_FRAMES - STRIDE_FRAMES) / WINDOW_SIZE_FRAMES * 100
-        print(f"  ✓ Windowing: 0.2s window, 0.1s stride (50% overlap) over 30s chunk")
-        print(f"  ✓ Compression ratio: {compression_ratio:.1f}x (1500 frames → {num_tokens} tokens)")
+        total_enc_frames = sum(w.shape[1] for w in windows)
+        compression_ratio = (total_enc_frames * 768) / num_tokens if num_tokens > 0 else 0
+        overlap_percent = (WINDOW_SECONDS - STRIDE_SECONDS) / WINDOW_SECONDS * 100
+        print(f"  ✓ Windowing: {WINDOW_SECONDS}s window, {STRIDE_SECONDS}s stride ({overlap_percent:.0f}% overlap)")
 
         # Step 5: Build prompt embeddings
         filename = os.path.basename(file_path)
@@ -315,29 +325,28 @@ def main():
         help="Number of compressed tokens per window (default: 4)"
     )
     parser.add_argument(
-        "--window-size",
-        type=int,
-        default=10,
-        help="Window size in frames (default: 10 frames ≈ 0.2s)"
+        "--window-seconds",
+        type=float,
+        default=0.2,
+        help="Audio window length in seconds (default: 0.2)",
     )
     parser.add_argument(
-        "--stride",
-        type=int,
-        default=5,
-        help="Stride in frames (default: 5 frames ≈ 0.1s, 50% overlap)"
+        "--stride-seconds",
+        type=float,
+        default=0.1,
+        help="Audio window stride in seconds (default: 0.1, 50%% overlap at 0.2s window)",
     )
 
     args = parser.parse_args()
 
-    # Update global windowing parameters if specified
-    global WINDOW_SIZE_FRAMES, STRIDE_FRAMES
-    WINDOW_SIZE_FRAMES = args.window_size
-    STRIDE_FRAMES = args.stride
+    global WINDOW_SECONDS, STRIDE_SECONDS
+    WINDOW_SECONDS = args.window_seconds
+    STRIDE_SECONDS = args.stride_seconds
 
     print(f"StreamingAdapter Configuration:")
-    print(f"  Window size: {WINDOW_SIZE_FRAMES} frames")
-    print(f"  Stride: {STRIDE_FRAMES} frames")
-    overlap_percent = (WINDOW_SIZE_FRAMES - STRIDE_FRAMES) / WINDOW_SIZE_FRAMES * 100
+    print(f"  Window: {WINDOW_SECONDS}s")
+    print(f"  Stride: {STRIDE_SECONDS}s")
+    overlap_percent = (WINDOW_SECONDS - STRIDE_SECONDS) / WINDOW_SECONDS * 100 if WINDOW_SECONDS > 0 else 0
     print(f"  Overlap: {overlap_percent:.0f}%")
     print(f"  Num queries: {args.num_queries}\n")
 
