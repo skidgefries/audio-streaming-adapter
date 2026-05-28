@@ -26,7 +26,6 @@
 15. [Key Differences Summary](#15-key-differences-summary)
 16. [Theoretical Foundation](#16-theoretical-foundation)
 17. [Related Work](#17-related-work)
-18. [Current Status](#18-current-status)
 
 ---
 
@@ -75,53 +74,35 @@ Only the adapter (and optionally the early-commit gate) are trained. The audio e
 
 Two inference paths exist. Both share the same per-window encode → adapter steps; they differ in how tokens reach the LLM.
 
-### 4.1 Shared per-window path (Components 1–3)
-
-Every 0.4 s hop (one overlapping window):
-
-```
-Live / file audio (16 kHz mono)
-  │
-  ▼
-AudioWaveformWindowizer                    src/adapter/windowing.py
-  │  slice 0.8 s chunk (12 800 samples)
-  ▼
-encode_waveform_to_hidden()                src/encoder/whisper_encoder.py
-  │  mel → pad to 3000 frames (30 s canvas)
-  │  Whisper-small encoder (frozen)
-  │  output: F ∈ R^{1500 × 768}            no trimming
-  ▼
-StreamingAdapter.forward_window()          src/adapter/streaming_adapter.py
-  │  learnable queries Q ∈ R^{m × 768}     m = 4 (num_queries)
-  │  Q-Former × 2 (self-attn + cross-attn + FFN)
-  │  optional AdaptiveRateController       stage 2+; hard gate at inference
-  │  output_proj: 768 → 4096
-  │  StabilityBuffer (EMA, α ≈ 0.8)
-  │  output: Z_t ∈ R^{m × 4096}            typically (1, 4, 4096)
-  ▼
-Append Z_t to accumulated sequence Z_{1:t}
-  │
-  ▼
-TurnEndCommitGate                          src/adapter/turn_end_commit_gate.py
-  │  SilenceTracker on Z_t (token activity)
-  │  attention-pool + classifier on Z_{1:t}
-  │  commit_prob, should_commit
-  ▼
-(branch on path below)
-```
-
-**Rate controller (optional, stage 2+):** scales or zeroes query slots per window based on complexity. Does not remove slots from the tensor — inactive slots become zeros.
-
-**Gate rule (default):** `should_commit = (commit_prob > τ) AND silence_ready`.
-
-### 4.2 Streaming inference (target path)
+### 4.1 Streaming inference (target path, unified)
 
 **Classes:** `WhisperAdapterLLMCommitGatePipeline.generate_streaming()`, `WhisperAdapterStreamingSession` (`src/adapter_llm_streaming.py`), `LlmKvCacheSession` (`src/llm/kv_cache.py`).
 
 ```
 For each window t = 0, 1, 2, …
   │
-  ├─ Steps 1–3 above (encode → adapter → gate on Z_{1:t})
+  ├─ AudioWaveformWindowizer                src/adapter/windowing.py
+  │    slice 0.8 s chunk (12 800 samples) every 0.4 s hop
+  │
+  ├─ encode_waveform_to_hidden()            src/encoder/whisper_encoder.py
+  │    mel → pad to 3000 frames (30 s canvas)
+  │    Whisper-small encoder (frozen)
+  │    output: F ∈ R^{1500 × 768}           no trimming
+  │
+  ├─ StreamingAdapter.forward_window()      src/adapter/streaming_adapter.py
+  │    learnable queries Q ∈ R^{m × 768}    m = 4 (num_queries)
+  │    Q-Former × 2 (self-attn + cross-attn + FFN)
+  │    optional AdaptiveRateController      stage 2+; hard gate at inference
+  │    output_proj: 768 → 4096
+  │    StabilityBuffer (EMA, α ≈ 0.8)
+  │    output: Z_t ∈ R^{m × 4096}           typically (1, 4, 4096)
+  │
+  ├─ Append Z_t to accumulated sequence Z_{1:t}
+  │
+  ├─ TurnEndCommitGate                      src/adapter/turn_end_commit_gate.py
+  │    SilenceTracker on Z_t (token activity)
+  │    attention-pool + classifier on Z_{1:t}
+  │    commit_prob, should_commit
   │
   ├─ LlmKvCacheSession.append_embeddings(Z_t)
   │     incrementally extend Qwen3-8B KV-cache (no re-encoding prior windows)
@@ -136,6 +117,10 @@ End of audio (no commit):
   optional finalize() → generate from cache
 ```
 
+**Rate controller (optional, stage 2+):** scales or zeroes query slots per window based on complexity. Does not remove slots from the tensor — inactive slots become zeros.
+
+**Gate rule (default):** `should_commit = (commit_prob > τ) AND silence_ready`.
+
 **Prompt modes:**
 
 | Mode | LLM prefix | When |
@@ -145,7 +130,7 @@ End of audio (no commit):
 
 **Demo:** `examples/streaming_demo.py`
 
-### 4.3 Batch inference (legacy path)
+### 4.2 Batch inference (legacy path)
 
 **Classes:** `WhisperAdapterLLMPipeline.generate()`, `WhisperAdapterLLMCommitGatePipeline.generate()`.
 
@@ -174,9 +159,9 @@ Single model.generate() on full prefix
 Text output
 ```
 
-**Difference from §4.2:** all windows are processed first; the LLM receives one batched prefix and decodes once. Gate records probabilities but does not trigger incremental decode.
+**Difference from §4.1:** all windows are processed first; the LLM receives one batched prefix and decodes once. Gate records probabilities but does not trigger incremental decode.
 
-### 4.4 Inference checklist by checkpoint
+### 4.3 Inference checklist by checkpoint
 
 | Checkpoint | Pipeline class | Method | Rate ctrl | Gate |
 |------------|----------------|--------|-----------|------|
@@ -891,32 +876,4 @@ We are evaluating smaller LLMs (e.g. Phi, Qwen3-4B) for further latency reductio
 | **Ethayarajh (2019)** | Characterised LM embedding anisotropy (cone collapse). |
 
 ---
-
-## 18. Current Status
-
-| Stage | Status | Notes |
-|-------|--------|-------|
-| Stage 1: Contrastive alignment | **Completed** | Centering fix applied; `checkpoints/adapter_stage1.pt` |
-| Stage 1 evaluation | **In progress** | Cosine retrieval on LibriSpeech test-clean |
-| Stage 2: ASR distillation | **Checkpoints available** | `adapter_stage2.pt`; streaming inference via `generate_streaming()` |
-| Stage 3: Task distillation | **Trainer ready** | `adapter_task_trainer.py` |
-| SALMONN baseline eval | **In progress** | `eval_librispeech_full_metrics.py` |
-
-### Planned Evaluation Protocol
-
-Once the SALMONN baseline run completes, we will establish baseline numbers for:
-
-| Metric | Mode | Tool |
-|--------|------|------|
-| R@1, R@5, R@10, MRR | NLL retrieval | `eval_librispeech_full_metrics.py` |
-| avg WER | ASR generation | `eval_librispeech_full_metrics.py` |
-| corpus BLEU-4 | ASR generation | `eval_librispeech_full_metrics.py` |
-
-Our Stage 1 system will then be evaluated on the same test set with:
-
-| Metric | Mode | Tool |
-|--------|------|------|
-| R@1, R@5, R@10, MRR | **Cosine** retrieval | `eval_retrieval.py` |
-| R@1, R@5, R@10, MRR | NLL retrieval | `eval_retrieval_nll.py` |
-
 SALMONN NLL numbers serve as the baseline for NLL retrieval and ASR. SALMONN cosine numbers are expected to be low and are reported only for completeness — they do not reflect SALMONN's audio understanding capability.
