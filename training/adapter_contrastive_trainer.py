@@ -378,7 +378,7 @@ def train():
             global_step += 1
 
             # Logging
-            if step % 1 == 0:
+            if step % 10 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 print(f"Step {step:4d}/{len(dataloader)} | "
                       f"Loss: {total_loss.item():.4f} | "

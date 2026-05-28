@@ -6,7 +6,7 @@ import os
 DOWNLOAD_DIR = "./datasets/librispeech_data"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-splits = ["dev-clean"] 
+splits = ["train-clean-360"] 
 # train-clean-100 done
 
 for split in splits:
