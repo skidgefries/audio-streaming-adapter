@@ -2,31 +2,43 @@ from __future__ import annotations
 
 import glob
 import os
+from collections.abc import Sequence
 
 import torch
 from torch.utils.data import Dataset
 
 
+def _index_librispeech_pairs(dataset_root: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for trans_file in glob.glob(f"{dataset_root}/**/*.trans.txt", recursive=True):
+        folder = os.path.dirname(trans_file)
+        with open(trans_file) as f:
+            for line in f:
+                parts = line.strip().split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                file_id, transcription = parts
+                audio_path = os.path.join(folder, f"{file_id}.flac")
+                if os.path.exists(audio_path):
+                    pairs.append((audio_path, transcription))
+    return pairs
+
+
 class LibriSpeechPairs(Dataset):
     """Index LibriSpeech (audio_path, transcription) pairs from `*.trans.txt` files."""
 
-    def __init__(self, dataset_root: str):
-        self.dataset_root = dataset_root
+    def __init__(self, dataset_root: str | Sequence[str]):
+        roots = [dataset_root] if isinstance(dataset_root, str) else list(dataset_root)
+        self.dataset_roots = roots
+        self.dataset_root = roots[0]
         self.pairs: list[tuple[str, str]] = []
 
-        for trans_file in glob.glob(f"{dataset_root}/**/*.trans.txt", recursive=True):
-            folder = os.path.dirname(trans_file)
-            with open(trans_file) as f:
-                for line in f:
-                    parts = line.strip().split(" ", 1)
-                    if len(parts) != 2:
-                        continue
-                    file_id, transcription = parts
-                    audio_path = os.path.join(folder, f"{file_id}.flac")
-                    if os.path.exists(audio_path):
-                        self.pairs.append((audio_path, transcription))
+        for root in roots:
+            split_pairs = _index_librispeech_pairs(root)
+            print(f"  {root}: {len(split_pairs)} pairs")
+            self.pairs.extend(split_pairs)
 
-        print(f"Found {len(self.pairs)} audio-transcription pairs")
+        print(f"Found {len(self.pairs)} audio-transcription pairs across {len(roots)} split(s)")
 
     def __len__(self) -> int:
         return len(self.pairs)

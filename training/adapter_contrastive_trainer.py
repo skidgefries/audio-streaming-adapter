@@ -51,6 +51,7 @@ from training.utils.logging import WandbLogger
 from training.utils.losses import contrastive_infonce_loss
 from training.utils.metrics import RunningMean
 from training.utils.loaders import load_frozen_qwen_embeddings
+from training.utils.stage1_validation import validate_stage1_contrastive, wandb_val_log_dict
 
 # Configuration
 DEVICE_CFG = DeviceConfig.from_env()
@@ -76,15 +77,13 @@ LLM_MODEL_ID = "Qwen/Qwen3-8B"
 STAGE = Stage1Config()
 OPT = OptimConfig(lr=1e-4, weight_decay=0.01, grad_clip_norm=0.5, warmup_steps=1000)
 # OPT = OptimConfig(lr=1e-3, weight_decay=0.01, grad_clip_norm=1.0, warmup_steps=0)
-DATA = DataConfig(
-    dataset_root=LibriSpeechConfig.default_train_clean_100_from_training_dir(os.path.dirname(__file__)).root,
-    batch_size=16,
-    num_workers=4,
-    max_windows_per_utt=None,
-)
+_TRAINING_DIR = os.path.dirname(__file__)
+DATASET_ROOTS = LibriSpeechConfig.train_clean_100_and_360_roots(_TRAINING_DIR)
+VAL_ROOT = LibriSpeechConfig.dev_clean_root(_TRAINING_DIR)
+DATA = DataConfig.from_env(default_dataset_root=DATASET_ROOTS[0])
 CKPT = CheckpointConfig(dir="checkpoints", save_every_epochs=1)
 HF_CKPT = HfCheckpointConfig.from_env()
-WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="s1-centred")
+WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="stage1")
 
 SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage1.pt")
 
@@ -140,8 +139,8 @@ def train():
     print(f"  LLM dim: {LLM_DIM}")
     print(f"  Max tokens/window: 4\n")
     
-    # Dataset and dataloader
-    dataset = LibriSpeechPairs(DATA.dataset_root)
+    # Dataset and dataloader (train-clean-100 + train-clean-360)
+    dataset = LibriSpeechPairs(DATASET_ROOTS)
     dataloader = DataLoader(
         dataset, 
         batch_size=DATA.batch_size, 
@@ -151,7 +150,7 @@ def train():
  
 #  check if the loss is working with a subset of the dataset   
     # dataset = LibriSpeechPairsCustom(
-    #     dataset_root=DATA.dataset_root,
+    #     dataset_root=DATA.DATASET_ROOTS,
     #     file_ids=[
     #         "374-180299-0001",   #IN THE COURSE OF THE DAY I RECEIVED THIS note
     #         "374-180299-0002",   #BE AT PRUDENCE'S TO NIGHT AT EIGHT
@@ -205,7 +204,7 @@ def train():
         run_name=WANDB.run_name,
         config={
             "stage": 1,
-            "data": DATA.__dict__,
+            "data": {**DATA.__dict__, "dataset_roots": DATASET_ROOTS, "val_root": VAL_ROOT},
             "optim": OPT.__dict__,
             "stage_cfg": STAGE.__dict__,
         },
@@ -236,6 +235,14 @@ def train():
         
     
     print(f"Starting Stage 1 training: Audio-Text Alignment")
+    print(f"  Dataset splits: {', '.join(os.path.basename(r) for r in DATASET_ROOTS)}")
+    if STAGE.val_enabled:
+        if os.path.isdir(VAL_ROOT):
+            cap = STAGE.val_max_utterances
+            cap_str = "all" if cap is None else str(cap)
+            print(f"  Validation: dev-clean ({VAL_ROOT}), max {cap_str} utterances/epoch")
+        else:
+            print(f"  Validation: dev-clean not found at {VAL_ROOT} (will skip until present)")
     print(f"  Epochs: {STAGE.epochs}")
     print(f"  Batch size: {DATA.batch_size}")
     print(f"  Learning rate: {OPT.lr}")
@@ -399,12 +406,39 @@ def train():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # Save checkpoint
+        # Validation on dev-clean
         print(f"\nEpoch {epoch + 1} complete:")
-        print(f"  Avg Loss: {m_total.mean:.4f}")
-        print(f"  Align Loss: {m_align.mean:.4f}")
-        print(f"  Stability Loss: {m_stab.mean:.4f}\n")
+        print(f"  Train Loss: {m_total.mean:.4f}")
+        print(f"  Train Align: {m_align.mean:.4f}")
+        print(f"  Train Stability: {m_stab.mean:.4f}")
 
+        epoch_metrics: dict[str, float] = {
+            "loss": m_total.mean,
+            "align": m_align.mean,
+            "stability": m_stab.mean,
+        }
+        if STAGE.val_enabled and os.path.isdir(VAL_ROOT):
+            val_metrics = validate_stage1_contrastive(
+                adapter=adapter,
+                audio_extractor=audio,
+                llm_tokenizer=llm_tokenizer,
+                text_embedder=text_embedder,
+                val_root=VAL_ROOT,
+                device=DEVICE,
+                batch_size=DATA.batch_size,
+                num_workers=DATA.num_workers,
+                temperature=STAGE.temperature,
+                lambda_stability=STAGE.lambda_stability,
+                max_utterances=STAGE.val_max_utterances,
+                pad_tokens_fn=_pad_tokens,
+                maybe_autocast_fn=_maybe_autocast,
+                epoch=epoch,
+            )
+            logger.log(wandb_val_log_dict(val_metrics), step=global_step)
+            epoch_metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
+        elif STAGE.val_enabled:
+            print(f"  [WARN] Skipping validation — dev-clean not found at {VAL_ROOT}")
+        print()
 
         EPOCH_SAVE_PATH = os.path.join(CKPT.dir, f"adapter_stage1_epoch{epoch+1}.pt")
             
@@ -417,7 +451,7 @@ def train():
                 adapter_state_dict=adapter.state_dict(),
                 optimizer_state_dict=optimizer.state_dict(),
                 scheduler_state_dict=scheduler.state_dict(),
-                metrics={"loss": m_total.mean, "align": m_align.mean, "stability": m_stab.mean},
+                metrics=epoch_metrics,
             ),
         )
         
@@ -430,7 +464,7 @@ def train():
                 adapter_state_dict=adapter.state_dict(),
                 optimizer_state_dict=optimizer.state_dict(),
                 scheduler_state_dict=scheduler.state_dict(),
-                metrics={"loss": m_total.mean, "align": m_align.mean, "stability": m_stab.mean},
+                metrics=epoch_metrics,
             ),
         )
         maybe_upload_stage_epoch_checkpoint(

@@ -166,6 +166,8 @@ class Stage1Config:
     lambda_stability: float = 0.1
     # lambda_stability = 0.0
     temperature: float = 0.2
+    val_enabled: bool = True
+    val_max_utterances: int | None = 100  # None = full dev-clean
 
 
 @dataclass(frozen=True)
