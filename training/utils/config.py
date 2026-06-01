@@ -101,7 +101,7 @@ class DataConfig:
                 max_windows_per_utt = parsed if parsed > 0 else None
         return cls(
             dataset_root=root,
-            batch_size=env_int("BATCH_SIZE", 16),
+            batch_size=env_int("BATCH_SIZE", 24),
             num_workers=env_int("NUM_WORKERS", 2),
             max_windows_per_utt=max_windows_per_utt,
         )

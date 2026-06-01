@@ -16,8 +16,13 @@ from training.utils.checkpointing import load_adapter_state_dict
 
 
 def default_librispeech_root_from_training_dir(training_dir: str) -> str:
-    """Resolve LibriSpeech root relative to a `training/` or `training/utils/` caller directory."""
+    """Resolve LibriSpeech train-clean-100 root (legacy single-split helper)."""
     return LibriSpeechConfig.default_train_clean_100_from_training_dir(training_dir).root
+
+
+def default_librispeech_train_roots_from_training_dir(training_dir: str) -> list[str]:
+    """train-clean-100 + train-clean-360 roots relative to ``training/``."""
+    return LibriSpeechConfig.train_clean_100_and_360_roots(training_dir)
 
 
 @dataclass(frozen=True)

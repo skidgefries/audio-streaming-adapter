@@ -42,11 +42,14 @@ sys.path.insert(0, _src_root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
-from training.utils.env import env_str, load_project_env
+from training.utils.env import apply_hf_hub_endpoint, env_str, load_project_env
 
 _env_path = load_project_env(_pkg_root)
 if _env_path:
     print(f"Loaded environment from {_env_path}")
+
+_hf_endpoint = apply_hf_hub_endpoint(_pkg_root)
+print(f"HF Hub endpoint: {_hf_endpoint}")
 
 _hf_token = env_str("HF_TOKEN")
 if _hf_token:
@@ -109,24 +112,27 @@ from training.utils.optimization import TrainingPipeline
 
 _, TORCH_DTYPE = default_device_and_dtype()
 
-MODEL_IDS = FrozenModelIdsConfig.from_env()
+_MODEL_IDS = FrozenModelIdsConfig.from_env()
 WHISPER_DIM = 768
 LLM_DIM = 4096
-WHISPER_MODEL = MODEL_IDS.whisper_model_id
-LLM_MODEL_ID = MODEL_IDS.llm_model_id
+WHISPER_MODEL = _MODEL_IDS.whisper_model_id
+LLM_MODEL_ID = _MODEL_IDS.llm_model_id
+
+_TRAINING_DIR = os.path.dirname(__file__)
+DATASET_ROOTS = LibriSpeechConfig.resolve_train_roots(
+    _TRAINING_DIR,
+    env_override=env_str("DATASET_ROOT"),
+)
+VAL_ROOT = LibriSpeechConfig.dev_clean_root(_TRAINING_DIR)
 
 STAGE = Stage2Config.from_env()
 GATE = GateConfig.from_env()
 DEVICE_CFG = DeviceConfig.from_env()
 OPT = OptimConfig.from_env()
-DATA = DataConfig.from_env(
-    default_dataset_root=LibriSpeechConfig.default_train_clean_100_from_training_dir(
-        os.path.dirname(__file__)
-    ).root,
-)
+DATA = DataConfig.from_env(default_dataset_root=DATASET_ROOTS[0])
 CKPT = CheckpointConfig.from_env(pkg_root=_pkg_root)
 HF_CKPT = HfCheckpointConfig.from_env()
-WANDB = WandbConfig.from_env()
+WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="stage2")
 
 SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage2.pt")
 _stage1_rel = env_str("STAGE1_CHECKPOINT", "checkpoints/adapter_stage1.pt") or "checkpoints/adapter_stage1.pt"
@@ -396,7 +402,12 @@ def train() -> None:
     )
     pipeline = TrainingPipeline(optimizer=optimizer, scheduler=scheduler, grad_clip_norm=OPT.grad_clip_norm)
 
-    dataset = LibriSpeechPairs(DATA.dataset_root)
+    if ctx.is_main:
+        print(
+            "Training LibriSpeech splits: "
+            + ", ".join(os.path.basename(r) for r in DATASET_ROOTS)
+        )
+    dataset = LibriSpeechPairs(DATASET_ROOTS)
     sampler: DistributedSampler | None = None
     if ctx.world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True)
@@ -417,7 +428,7 @@ def train() -> None:
         run_name=WANDB.run_name,
         config={
             "stage": 2,
-            "data": DATA.__dict__,
+            "data": {**DATA.__dict__, "dataset_roots": DATASET_ROOTS, "val_root": VAL_ROOT},
             "optim": OPT.__dict__,
             "stage_cfg": STAGE.__dict__,
             "gate_cfg": GATE.__dict__,

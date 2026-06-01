@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+_DEFAULT_HF_ENDPOINT = "https://huggingface.co"
+
 
 def package_root(start: str | None = None) -> str:
     """Directory containing ``pyproject.toml`` (``audio-streaming-adapter/``)."""
@@ -43,12 +45,42 @@ def load_project_env(root: str | None = None, *, override: bool = False) -> str 
             continue
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
-        if override:
+        if override or key == "HF_ENDPOINT":
             os.environ[key] = value
         else:
             os.environ.setdefault(key, value)
 
     return str(env_path)
+
+
+def apply_hf_hub_endpoint(root: str | None = None) -> str:
+    """
+    Point Hugging Face Hub at the official endpoint (or ``HF_ENDPOINT`` in ``.env``).
+
+    Some hosts install ``site-packages/hf_config.pth`` that forces an unstable mirror;
+    call this after ``load_project_env`` and before importing ``transformers`` / ``llm``.
+    """
+    env_path = Path(root or package_root()) / ".env"
+    endpoint = _DEFAULT_HF_ENDPOINT
+    if env_path.is_file():
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            key, _, value = line.partition("=")
+            if key.strip() != "HF_ENDPOINT":
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if value:
+                endpoint = value
+            break
+    endpoint = endpoint.rstrip("/")
+    os.environ["HF_ENDPOINT"] = endpoint
+    return endpoint
 
 
 def env_str(key: str, default: str | None = None) -> str | None:
