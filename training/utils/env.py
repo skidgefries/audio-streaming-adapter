@@ -6,6 +6,17 @@ import os
 from pathlib import Path
 
 
+def _strip_inline_comment(value: str) -> str:
+    """Drop `` # ...`` suffix on unquoted .env values (matches common dotenv behavior)."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value
+    for sep in (" #", "\t#"):
+        idx = value.find(sep)
+        if idx != -1:
+            return value[:idx].rstrip()
+    return value
+
+
 def package_root(start: str | None = None) -> str:
     """Directory containing ``pyproject.toml`` (``audio-streaming-adapter/``)."""
     cur = Path(start or Path(__file__).resolve()).parent
@@ -38,7 +49,7 @@ def load_project_env(root: str | None = None, *, override: bool = False) -> str 
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip()
+        value = _strip_inline_comment(value.strip())
         if not key:
             continue
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -55,7 +66,7 @@ def env_str(key: str, default: str | None = None) -> str | None:
     value = os.environ.get(key)
     if value is None or not str(value).strip():
         return default
-    return str(value).strip()
+    return _strip_inline_comment(str(value).strip())
 
 
 def env_bool(key: str, default: bool = False) -> bool:

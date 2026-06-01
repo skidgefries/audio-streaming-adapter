@@ -83,7 +83,7 @@ VAL_ROOT = LibriSpeechConfig.dev_clean_root(_TRAINING_DIR)
 DATA = DataConfig.from_env(default_dataset_root=DATASET_ROOTS[0])
 CKPT = CheckpointConfig(dir="checkpoints", save_every_epochs=1)
 HF_CKPT = HfCheckpointConfig.from_env()
-WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="stage1")
+WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="stage1-bigger-dataset")
 
 SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage1.pt")
 

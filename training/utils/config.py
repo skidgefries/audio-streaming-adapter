@@ -197,9 +197,20 @@ class Stage2Config:
     max_text_tokens: int = 128
     asr_micro_batch_size: int = 1
     enable_llm_gradient_checkpointing: bool = False
+    val_enabled: bool = True
+    val_every_steps: int = 1000
+    val_max_utterances: int | None = 100  # None = full dev-clean
 
     @classmethod
     def from_env(cls) -> Stage2Config:
+        val_max_raw = env_str("VAL_MAX_UTTERANCES")
+        val_max_utterances: int | None = 100
+        if val_max_raw:
+            normalized = val_max_raw.strip().lower()
+            if normalized in {"all", "none", "unlimited"}:
+                val_max_utterances = None
+            else:
+                val_max_utterances = int(val_max_raw)
         return cls(
             epochs=env_int("EPOCHS", 10),
             lambda_align=env_float("LAMBDA_ALIGN", 0.1),
@@ -214,6 +225,9 @@ class Stage2Config:
             enable_llm_gradient_checkpointing=env_bool(
                 "ENABLE_LLM_GRADIENT_CHECKPOINTING", False
             ),
+            val_enabled=env_bool("VAL_ENABLED", True),
+            val_every_steps=env_int("VAL_EVERY_STEPS", 1000),
+            val_max_utterances=val_max_utterances,
         )
 
 

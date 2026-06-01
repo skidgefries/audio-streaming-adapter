@@ -106,8 +106,12 @@ from training.utils.metrics import RunningMean
 from training.utils.asr_prompt import DEFAULT_ASR_PROMPT, PROMPT_CONDITIONING, TRAIN_STYLE_CONDITIONING
 from training.utils.loaders import default_device_and_dtype, load_frozen_qwen_causal_lm
 from training.utils.optimization import TrainingPipeline
+from training.utils.stage2_validation import validate_stage2_asr, wandb_val_log_dict
 
 _, TORCH_DTYPE = default_device_and_dtype()
+_TRAINING_DIR = os.path.dirname(__file__)
+DATASET_ROOTS = LibriSpeechConfig.train_clean_100_and_360_roots(_TRAINING_DIR)
+VAL_ROOT = LibriSpeechConfig.dev_clean_root(_TRAINING_DIR)
 
 MODEL_IDS = FrozenModelIdsConfig.from_env()
 WHISPER_DIM = 768
@@ -119,14 +123,10 @@ STAGE = Stage2Config.from_env()
 GATE = GateConfig.from_env()
 DEVICE_CFG = DeviceConfig.from_env()
 OPT = OptimConfig.from_env()
-DATA = DataConfig.from_env(
-    default_dataset_root=LibriSpeechConfig.default_train_clean_100_from_training_dir(
-        os.path.dirname(__file__)
-    ).root,
-)
+DATA = DataConfig.from_env(default_dataset_root=DATASET_ROOTS[0])
 CKPT = CheckpointConfig.from_env(pkg_root=_pkg_root)
 HF_CKPT = HfCheckpointConfig.from_env()
-WANDB = WandbConfig.from_env()
+WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="stage2-bigger-dataset")
 
 SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage2.pt")
 _stage1_rel = env_str("STAGE1_CHECKPOINT", "checkpoints/adapter_stage1.pt") or "checkpoints/adapter_stage1.pt"
@@ -396,7 +396,7 @@ def train() -> None:
     )
     pipeline = TrainingPipeline(optimizer=optimizer, scheduler=scheduler, grad_clip_norm=OPT.grad_clip_norm)
 
-    dataset = LibriSpeechPairs(DATA.dataset_root)
+    dataset = LibriSpeechPairs(DATASET_ROOTS)
     sampler: DistributedSampler | None = None
     if ctx.world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True)
@@ -417,7 +417,7 @@ def train() -> None:
         run_name=WANDB.run_name,
         config={
             "stage": 2,
-            "data": DATA.__dict__,
+            "data": {**DATA.__dict__, "dataset_roots": DATASET_ROOTS, "val_root": VAL_ROOT},
             "optim": OPT.__dict__,
             "stage_cfg": STAGE.__dict__,
             "gate_cfg": GATE.__dict__,
@@ -445,6 +445,17 @@ def train() -> None:
 
     if ctx.is_main:
         print("\nStarting Stage 2 training: ASR Distillation")
+        print(f"  Dataset splits: {', '.join(os.path.basename(r) for r in DATASET_ROOTS)}")
+        if STAGE.val_enabled:
+            if os.path.isdir(VAL_ROOT):
+                cap = STAGE.val_max_utterances
+                cap_str = "all" if cap is None else str(cap)
+                print(
+                    f"  Validation: dev-clean ({VAL_ROOT}), every {STAGE.val_every_steps} steps, "
+                    f"max {cap_str} utterances"
+                )
+            else:
+                print(f"  Validation: dev-clean not found at {VAL_ROOT} (will skip until present)")
         print(f"  Epochs: {STAGE.epochs}")
         print(f"  Batch size: {DATA.batch_size}")
         print(f"  Learning rate: {OPT.lr}")
@@ -686,6 +697,43 @@ def train() -> None:
                     },
                     step=pipeline.global_step,
                 )
+
+            if (
+                ctx.is_main
+                and STAGE.val_enabled
+                and pipeline.global_step > 0
+                and pipeline.global_step % STAGE.val_every_steps == 0
+            ):
+                if os.path.isdir(VAL_ROOT):
+                    val_metrics = validate_stage2_asr(
+                        adapter=_unwrap(adapter),
+                        gate=_unwrap(gate),
+                        audio_extractor=audio,
+                        llm_model=llm_model,
+                        llm_tokenizer=llm_tokenizer,
+                        text_embedder=text_embedder,
+                        asr_forward_loss_fn=lambda **kwargs: _asr_forward_loss(llm_model, **kwargs),
+                        val_root=VAL_ROOT,
+                        train_device=train_device,
+                        llm_device=llm_device,
+                        batch_size=DATA.batch_size,
+                        num_workers=DATA.num_workers,
+                        max_utterances=STAGE.val_max_utterances,
+                        max_windows_per_utt=DATA.max_windows_per_utt,
+                        max_text_tokens=STAGE.max_text_tokens,
+                        asr_micro_batch_size=STAGE.asr_micro_batch_size,
+                        lambda_align=STAGE.lambda_align,
+                        lambda_stability=STAGE.lambda_stability,
+                        lambda_rate=STAGE.lambda_rate,
+                        lambda_gate=STAGE.lambda_gate,
+                        temperature=STAGE.temperature,
+                        maybe_autocast_fn=_maybe_autocast,
+                        torch_dtype=TORCH_DTYPE,
+                        global_step=pipeline.global_step,
+                    )
+                    logger.log(wandb_val_log_dict(val_metrics), step=pipeline.global_step)
+                else:
+                    print(f"  [WARN] Skipping validation — dev-clean not found at {VAL_ROOT}")
 
             if train_device.type == "cuda":
                 torch.cuda.empty_cache()

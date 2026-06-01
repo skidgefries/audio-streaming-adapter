@@ -30,8 +30,7 @@ LLM_DIM = 4096
 WHISPER_MODEL = "openai/whisper-small"
 LLM_MODEL_ID = "Qwen/Qwen3-8B"
 
-# CHECKPOINT_PATH = "checkpoints/adapter_adapter.pt"
-CHECKPOINT_PATH = "checkpoints/adapter_stage2.pt"
+CHECKPOINT_PATH = "checkpoints/adapter_stage1_epoch7.pt"
 TEST_CLEAN_ROOT = "datasets/librispeech_data/LibriSpeech/test-clean"
 NUM_UTTERANCES = 100  # how many to evaluate on
 
