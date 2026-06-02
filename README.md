@@ -58,15 +58,15 @@ cp .env.example .env
 # set CUDA_VISIBLE_DEVICES, WANDB_API_KEY, HF_TOKEN, etc.
 ```
 
-2. Run the setup script (sources **`.env`** first, then pyenv 3.12, **`uv sync`**, **PyTorch CUDA compatibility check** with automatic wheel reinstall, LibriSpeech download, Stage 1 checkpoint fetch, and training):
+2. Run the setup script (sources **`.env`** first, then pyenv 3.12, **`uv sync`**, **PyTorch CUDA compatibility check**, LibriSpeech download (`src/dataset/load_dataset.py`), Stage 1 checkpoint fetch, parallel prefetch of **Whisper small** + **Qwen3-8B**, then `uv run python training/adapter_asr_trainer.py`):
 
 ```bash
 bash scripts/setup_remote_training.sh
 ```
 
-Setup only (no training): set `SKIP_TRAINING=1` in `.env` or export it before running the script.
+Setup only (no training): set `SKIP_TRAINING=1` in `.env`. Skip model cache warmup with `SKIP_MODEL_PREFETCH=1`.
 
-**Launchers:** one visible GPU → `uv run training/adapter_asr_trainer.py`; two or more → `torchrun --nproc_per_node=1` (frozen Qwen auto-shards across GPUs). Set `DEVICE=cpu` to force CPU. See `training/utils/config.py` (`DeviceConfig`, `TrainingLaunchConfig`).
+**GPUs:** with two visible GPUs (`CUDA_VISIBLE_DEVICES=0,1`), Stage 2 auto-shards the frozen Qwen across devices (`device_map="auto"`). Set `DEVICE=cpu` to force CPU. See `training/utils/config.py` (`DeviceConfig`).
 
 Requires **pyenv**, **uv**, and **wget** or **curl**.
 

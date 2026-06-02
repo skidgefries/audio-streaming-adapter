@@ -5,7 +5,7 @@
 #   cp .env.example .env   # edit values
 #   bash scripts/setup_remote_training.sh
 #
-# Order: source .env → pyenv/uv → PyTorch compat check → dataset → checkpoint → train
+# Order: source .env → pyenv/uv → PyTorch compat → LibriSpeech → checkpoint → models (parallel) → train
 #
 set -euo pipefail
 
@@ -83,22 +83,6 @@ count_training_gpus() {
   echo "0"
 }
 
-should_use_torchrun() {
-  local gpus="$1"
-  local mode="${USE_TORCHRUN:-auto}"
-  mode="${mode,,}"
-  case "$mode" in
-    1 | true | yes | on) return 0 ;;
-    0 | false | no | off) return 1 ;;
-    *)
-      if [[ "$gpus" -ge 2 ]]; then
-        return 0
-      fi
-      return 1
-      ;;
-  esac
-}
-
 prepare_dataset_dir() {
   log "Creating datasets/librispeech_data"
   mkdir -p datasets/librispeech_data
@@ -109,8 +93,8 @@ download_librispeech() {
     log "Skipping LibriSpeech download (SKIP_DATASET=1)"
     return
   fi
-  log "Downloading LibriSpeech train-clean-100"
-  uv run src/dataset/load_dataset.py
+  log "Downloading LibriSpeech (train-clean-100, train-clean-360, dev-clean)"
+  uv run python src/dataset/load_dataset.py
 }
 
 download_stage1_checkpoint() {
@@ -145,31 +129,28 @@ download_stage1_checkpoint() {
   log "Saved checkpoint to ${ckpt_path}"
 }
 
+prefetch_frozen_models() {
+  if [[ "${SKIP_MODEL_PREFETCH:-0}" == "1" ]]; then
+    log "Skipping model prefetch (SKIP_MODEL_PREFETCH=1)"
+    return
+  fi
+  local whisper_id="${WHISPER_MODEL_ID:-openai/whisper-small}"
+  local llm_id="${LLM_MODEL_ID:-Qwen/Qwen3-8B}"
+  log "Prefetching frozen models in parallel: ${whisper_id}, ${llm_id}"
+  uv run python scripts/prefetch_frozen_models.py
+}
+
 run_training() {
   if [[ "${SKIP_TRAINING:-0}" == "1" ]]; then
     log "Skipping training (SKIP_TRAINING=1)"
     return
   fi
 
-  local gpus nproc port
+  local gpus
   gpus="$(count_training_gpus)"
-  nproc="${TORCHRUN_NPROC_PER_NODE:-1}"
-  port="${TORCHRUN_MASTER_PORT:-29500}"
-
   log "Training GPUs (effective): ${gpus}"
-
-  if should_use_torchrun "$gpus"; then
-    log "Multi-GPU launch: torchrun --nproc_per_node=${nproc} training/adapter_asr_trainer.py"
-    uv run torchrun \
-      --standalone \
-      --nnodes=1 \
-      --nproc_per_node="${nproc}" \
-      --master_port="${port}" \
-      training/adapter_asr_trainer.py
-  else
-    log "Single-GPU launch: uv run training/adapter_asr_trainer.py"
-    uv run training/adapter_asr_trainer.py
-  fi
+  log "Launch: uv run python training/adapter_asr_trainer.py"
+  uv run python training/adapter_asr_trainer.py
 }
 
 main() {
@@ -181,6 +162,7 @@ main() {
   prepare_dataset_dir
   download_librispeech
   download_stage1_checkpoint
+  prefetch_frozen_models
   run_training
   log "Done."
 }
