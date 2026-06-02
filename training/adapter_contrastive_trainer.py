@@ -20,11 +20,14 @@ sys.path.insert(0, _src_root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
-from training.utils.env import env_str, load_project_env
+from training.utils.env import apply_hf_hub_endpoint, env_str, load_project_env
 
 _env_path = load_project_env(_pkg_root)
 if _env_path:
     print(f"Loaded environment from {_env_path}")
+
+_hf_endpoint = apply_hf_hub_endpoint(_pkg_root)
+print(f"HF Hub endpoint: {_hf_endpoint}")
 
 _hf_token = env_str("HF_TOKEN")
 if _hf_token:
@@ -78,7 +81,10 @@ STAGE = Stage1Config()
 OPT = OptimConfig(lr=1e-4, weight_decay=0.01, grad_clip_norm=0.5, warmup_steps=1000)
 # OPT = OptimConfig(lr=1e-3, weight_decay=0.01, grad_clip_norm=1.0, warmup_steps=0)
 _TRAINING_DIR = os.path.dirname(__file__)
-DATASET_ROOTS = LibriSpeechConfig.train_clean_100_and_360_roots(_TRAINING_DIR)
+DATASET_ROOTS = LibriSpeechConfig.resolve_train_roots(
+    _TRAINING_DIR,
+    env_override=env_str("DATASET_ROOT"),
+)
 VAL_ROOT = LibriSpeechConfig.dev_clean_root(_TRAINING_DIR)
 DATA = DataConfig.from_env(default_dataset_root=DATASET_ROOTS[0])
 CKPT = CheckpointConfig(dir="checkpoints", save_every_epochs=1)

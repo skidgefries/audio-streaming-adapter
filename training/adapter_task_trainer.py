@@ -26,11 +26,14 @@ sys.path.insert(0, _src_root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
-from training.utils.env import env_str, load_project_env
+from training.utils.env import apply_hf_hub_endpoint, env_str, load_project_env
 
 _env_path = load_project_env(_pkg_root)
 if _env_path:
     print(f"Loaded environment from {_env_path}")
+
+_hf_endpoint = apply_hf_hub_endpoint(_pkg_root)
+print(f"HF Hub endpoint: {_hf_endpoint}")
 
 _hf_token = env_str("HF_TOKEN")
 if _hf_token:
@@ -76,12 +79,18 @@ WHISPER_MODEL = "openai/whisper-small"
 STUDENT_LLM_ID = "Qwen/Qwen3-8B"
 TEACHER_LLM_ID = "Qwen/Qwen3-8B"
 
+_TRAINING_DIR = os.path.dirname(__file__)
+DATASET_ROOTS = LibriSpeechConfig.resolve_train_roots(
+    _TRAINING_DIR,
+    env_override=env_str("DATASET_ROOT"),
+)
+
 STAGE = Stage3Config()
 GATE = GateConfig.from_env()
 DEV = Stage3DeviceConfig()
 OPT = OptimConfig(lr=3e-5, weight_decay=0.01, grad_clip_norm=1.0, warmup_steps=0)
 DATA = DataConfig(
-    dataset_root=LibriSpeechConfig.default_train_clean_100_from_training_dir(os.path.dirname(__file__)).root,
+    dataset_root=DATASET_ROOTS[0],
     batch_size=1,
     num_workers=0,
     max_windows_per_utt=None,
@@ -202,7 +211,7 @@ def train() -> None:
             max_samples=GATE.smart_turn_max_samples,
         )
         if GATE.label_source == "smart_turn"
-        else LibriSpeechPairs(DATA.dataset_root)
+        else LibriSpeechPairs(DATASET_ROOTS)
     )
     collate_fn = smart_turn_collate if GATE.label_source == "smart_turn" else None
 

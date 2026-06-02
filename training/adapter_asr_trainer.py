@@ -42,11 +42,14 @@ sys.path.insert(0, _src_root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
-from training.utils.env import env_str, load_project_env
+from training.utils.env import apply_hf_hub_endpoint, env_str, load_project_env
 
 _env_path = load_project_env(_pkg_root)
 if _env_path:
     print(f"Loaded environment from {_env_path}")
+
+_hf_endpoint = apply_hf_hub_endpoint(_pkg_root)
+print(f"HF Hub endpoint: {_hf_endpoint}")
 
 _hf_token = env_str("HF_TOKEN")
 if _hf_token:
@@ -113,11 +116,18 @@ _TRAINING_DIR = os.path.dirname(__file__)
 DATASET_ROOTS = LibriSpeechConfig.train_clean_100_and_360_roots(_TRAINING_DIR)
 VAL_ROOT = LibriSpeechConfig.dev_clean_root(_TRAINING_DIR)
 
-MODEL_IDS = FrozenModelIdsConfig.from_env()
+_MODEL_IDS = FrozenModelIdsConfig.from_env()
 WHISPER_DIM = 768
 LLM_DIM = 4096
-WHISPER_MODEL = MODEL_IDS.whisper_model_id
-LLM_MODEL_ID = MODEL_IDS.llm_model_id
+WHISPER_MODEL = _MODEL_IDS.whisper_model_id
+LLM_MODEL_ID = _MODEL_IDS.llm_model_id
+
+_TRAINING_DIR = os.path.dirname(__file__)
+DATASET_ROOTS = LibriSpeechConfig.resolve_train_roots(
+    _TRAINING_DIR,
+    env_override=env_str("DATASET_ROOT"),
+)
+VAL_ROOT = LibriSpeechConfig.dev_clean_root(_TRAINING_DIR)
 
 STAGE = Stage2Config.from_env()
 GATE = GateConfig.from_env()
@@ -396,6 +406,11 @@ def train() -> None:
     )
     pipeline = TrainingPipeline(optimizer=optimizer, scheduler=scheduler, grad_clip_norm=OPT.grad_clip_norm)
 
+    if ctx.is_main:
+        print(
+            "Training LibriSpeech splits: "
+            + ", ".join(os.path.basename(r) for r in DATASET_ROOTS)
+        )
     dataset = LibriSpeechPairs(DATASET_ROOTS)
     sampler: DistributedSampler | None = None
     if ctx.world_size > 1:
