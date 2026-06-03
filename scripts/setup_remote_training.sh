@@ -23,24 +23,50 @@ require_cmd() {
 
 source_env() {
   local env_file="${ROOT}/.env"
+  local example_file="${ROOT}/.env.example"
+  if [[ ! -f "$env_file" && -f "$example_file" ]]; then
+    cp "$example_file" "$env_file"
+    log "Created ${env_file} from .env.example (edit values as needed)"
+  elif [[ ! -f "$env_file" ]]; then
+    log "No ${env_file} — copy .env.example to .env and fill required values"
+  fi
   if [[ -f "$env_file" ]]; then
     set -a
     # shellcheck disable=SC1090
     source "$env_file"
     set +a
     log "Sourced ${env_file}"
-  else
-    log "No ${env_file} — copy .env.example to .env and fill required values"
   fi
+}
+
+find_python312() {
+  local candidate
+  for candidate in python3.12 python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+      && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
 }
 
 setup_pyenv() {
   if [[ "${SKIP_PYENV:-0}" == "1" ]]; then
     log "Skipping pyenv (SKIP_PYENV=1)"
+    local py
+    py="$(find_python312 || true)"
+    [[ -n "$py" ]] && log "Using system Python: $($py --version) ($py)"
     return
   fi
   if ! command -v pyenv >/dev/null 2>&1; then
-    die "pyenv not found. Install pyenv or set SKIP_PYENV=1 with Python 3.12+ on PATH."
+    local py
+    py="$(find_python312 || true)"
+    if [[ -n "$py" ]]; then
+      log "pyenv not found — using system Python: $($py --version) ($py)"
+      return
+    fi
+    die "pyenv not found and no Python 3.12+ on PATH. Install pyenv, install Python 3.12+, or set SKIP_PYENV=1."
   fi
   local version="${PYENV_VERSION:-3.12}"
   log "pyenv: install/use Python ${version}"

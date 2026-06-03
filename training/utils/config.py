@@ -38,9 +38,12 @@ class CheckpointConfig:
         ckpt_dir = env_str("CHECKPOINT_DIR", "checkpoints") or "checkpoints"
         if pkg_root and not os.path.isabs(ckpt_dir):
             ckpt_dir = os.path.join(pkg_root, ckpt_dir)
+        save_every_steps = env_optional_int("SAVE_EVERY_STEPS")
+        if save_every_steps is None:
+            save_every_steps = env_optional_int("CHECKPOINT_SAVE_EVERY_STEPS")
         return cls(
             dir=ckpt_dir,
-            save_every_steps=env_optional_int("CHECKPOINT_SAVE_EVERY_STEPS"),
+            save_every_steps=save_every_steps,
             save_every_epochs=env_int("CHECKPOINT_SAVE_EVERY_EPOCHS", 1),
         )
 

@@ -23,7 +23,7 @@ sys.path.insert(0, _pkg_root)
 
 from src.adapter.streaming_adapter import StreamingAdapter
 from src.dataset import LibriSpeechPairs, load_mono_waveform_16k
-from src.encoder.waveform_window_encoder import WhisperWindowFeatureExtractor, unpack_encoder_window
+from src.encoder.waveform_window_encoder import WhisperWindowFeatureExtractor
 from training.utils.config import Stage2Config
 from training.utils.loaders import default_device_and_dtype, load_frozen_qwen_embeddings
 
@@ -40,7 +40,7 @@ CHECKPOINT_PATH = os.path.join(_pkg_root, "checkpoints", "adapter_stage2.pt")
 TEST_CLEAN_ROOT = os.path.join(
     _pkg_root, "datasets/librispeech_data/LibriSpeech/test-clean"
 )
-NUM_UTTERANCES = 2000
+NUM_UTTERANCES = 2620
 
 
 def load_models(checkpoint_path: str = CHECKPOINT_PATH):
@@ -105,8 +105,7 @@ def compute_embeddings(audio_extractor, tokenizer, text_embedder, adapter, pairs
         chunks = []
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             for w in windows:
-                enc, enc_mask = unpack_encoder_window(w)
-                out = adapter.forward_window(enc, encoder_attention_mask=enc_mask)
+                out = adapter.forward_window(w)
                 chunks.append(out["tokens"])
 
         audio_tokens = torch.cat(chunks, dim=1)

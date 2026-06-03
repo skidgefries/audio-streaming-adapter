@@ -154,6 +154,79 @@ def _maybe_autocast(device: torch.device):
     return nullcontext()
 
 
+def _stage2_epoch_metrics(
+    m_total: RunningMean,
+    m_asr: RunningMean,
+    m_align: RunningMean,
+    m_stab: RunningMean,
+    m_sparse: RunningMean,
+    m_rate: RunningMean,
+    m_gate: RunningMean,
+) -> dict[str, float]:
+    return {
+        "loss": m_total.mean,
+        "asr": m_asr.mean,
+        "align": m_align.mean,
+        "stability": m_stab.mean,
+        "sparse": m_sparse.mean,
+        "rate": m_rate.mean,
+        "gate": m_gate.mean,
+    }
+
+
+def _make_stage2_checkpoint(
+    *,
+    epoch: int,
+    global_step: int,
+    adapter: torch.nn.Module,
+    gate: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    metrics: dict[str, float],
+) -> TrainingCheckpoint:
+    return TrainingCheckpoint(
+        stage=2,
+        epoch=epoch,
+        global_step=global_step,
+        adapter_state_dict=_unwrap(adapter).state_dict(),
+        gate_state_dict=_unwrap(gate).state_dict(),
+        optimizer_state_dict=optimizer.state_dict(),
+        scheduler_state_dict=scheduler.state_dict(),
+        metrics=metrics,
+    )
+
+
+def _maybe_save_step_checkpoint(
+    *,
+    epoch: int,
+    adapter: torch.nn.Module,
+    gate: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    pipeline: TrainingPipeline,
+    metrics: dict[str, float],
+) -> None:
+    interval = CKPT.save_every_steps
+    if interval is None or interval <= 0:
+        return
+    step = pipeline.global_step
+    if step <= 0 or step % interval != 0:
+        return
+    ckpt = _make_stage2_checkpoint(
+        epoch=epoch + 1,
+        global_step=step,
+        adapter=adapter,
+        gate=gate,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        metrics=metrics,
+    )
+    save_checkpoint(SAVE_PATH, ckpt)
+    step_path = os.path.join(CKPT.dir, f"adapter_stage2_step{step}.pt")
+    save_checkpoint(step_path, ckpt)
+    print(f"  Checkpoint (step {step}) -> {SAVE_PATH}\n              step file -> {step_path}")
+
+
 def _enable_llm_gradient_checkpointing(llm_model: torch.nn.Module) -> None:
     if not STAGE.enable_llm_gradient_checkpointing:
         return
@@ -220,7 +293,7 @@ def train_smart_turn_gate(ctx, *, train_device, audio, adapter, gate, pipeline, 
         sampler = DistributedSampler(dataset, num_replicas=ctx.world_size, rank=ctx.rank, shuffle=True)
     dataloader = DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=8,
         shuffle=sampler is None,
         sampler=sampler,
         num_workers=DATA.num_workers,
@@ -471,6 +544,11 @@ def train() -> None:
                 )
             else:
                 print(f"  Validation: dev-clean not found at {VAL_ROOT} (will skip until present)")
+        if CKPT.save_every_steps:
+            print(
+                f"  Checkpoints: every {CKPT.save_every_steps} steps -> "
+                f"{CKPT.dir}/adapter_stage2_step<N>.pt (and {SAVE_PATH})"
+            )
         print(f"  Epochs: {STAGE.epochs}")
         print(f"  Batch size: {DATA.batch_size}")
         print(f"  Learning rate: {OPT.lr}")
@@ -750,52 +828,50 @@ def train() -> None:
                 else:
                     print(f"  [WARN] Skipping validation — dev-clean not found at {VAL_ROOT}")
 
+            if ctx.is_main:
+                _maybe_save_step_checkpoint(
+                    epoch=epoch,
+                    adapter=adapter,
+                    gate=gate,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    pipeline=pipeline,
+                    metrics=_stage2_epoch_metrics(
+                        m_total, m_asr, m_align, m_stab, m_sparse, m_rate, m_gate
+                    ),
+                )
+
             if train_device.type == "cuda":
                 torch.cuda.empty_cache()
 
         if ctx.is_main:
+            epoch_metrics = _stage2_epoch_metrics(
+                m_total, m_asr, m_align, m_stab, m_sparse, m_rate, m_gate
+            )
             save_checkpoint(
                 SAVE_PATH,
-                TrainingCheckpoint(
-                    stage=2,
+                _make_stage2_checkpoint(
                     epoch=epoch + 1,
                     global_step=pipeline.global_step,
-                    adapter_state_dict=_unwrap(adapter).state_dict(),
-                    gate_state_dict=_unwrap(gate).state_dict(),
-                    optimizer_state_dict=optimizer.state_dict(),
-                    scheduler_state_dict=scheduler.state_dict(),
-                    metrics={
-                        "loss": m_total.mean,
-                        "asr": m_asr.mean,
-                        "align": m_align.mean,
-                        "stability": m_stab.mean,
-                        "sparse": m_sparse.mean,
-                        "rate": m_rate.mean,
-                        "gate": m_gate.mean,
-                    },
+                    adapter=adapter,
+                    gate=gate,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    metrics=epoch_metrics,
                 ),
             )
 
             epoch_save_path = os.path.join(CKPT.dir, f"adapter_stage2_epoch{epoch + 1}.pt")
             save_checkpoint(
                 epoch_save_path,
-                TrainingCheckpoint(
-                    stage=2,
+                _make_stage2_checkpoint(
                     epoch=epoch + 1,
                     global_step=pipeline.global_step,
-                    adapter_state_dict=_unwrap(adapter).state_dict(),
-                    gate_state_dict=_unwrap(gate).state_dict(),
-                    optimizer_state_dict=optimizer.state_dict(),
-                    scheduler_state_dict=scheduler.state_dict(),
-                    metrics={
-                        "loss": m_total.mean,
-                        "asr": m_asr.mean,
-                        "align": m_align.mean,
-                        "stability": m_stab.mean,
-                        "sparse": m_sparse.mean,
-                        "rate": m_rate.mean,
-                        "gate": m_gate.mean,
-                    },
+                    adapter=adapter,
+                    gate=gate,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    metrics=epoch_metrics,
                 ),
             )
             maybe_upload_stage_epoch_checkpoint(

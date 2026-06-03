@@ -62,3 +62,8 @@ class LibriSpeechConfig:
         """LibriSpeech dev-clean split (validation)."""
         return os.path.join(LibriSpeechConfig._librispeech_base(training_dir), "dev-clean")
 
+    @staticmethod
+    def test_clean_root(training_dir: str) -> str:
+        """LibriSpeech test-clean split (held-out evaluation)."""
+        return os.path.join(LibriSpeechConfig._librispeech_base(training_dir), "test-clean")
+

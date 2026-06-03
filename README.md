@@ -68,7 +68,7 @@ Setup only (no training): set `SKIP_TRAINING=1` in `.env`. Skip model cache warm
 
 **GPUs:** with two visible GPUs (`CUDA_VISIBLE_DEVICES=0,1`), Stage 2 auto-shards the frozen Qwen across devices (`device_map="auto"`). Set `DEVICE=cpu` to force CPU. See `training/utils/config.py` (`DeviceConfig`).
 
-Requires **pyenv**, **uv**, and **wget** or **curl**.
+Requires **uv** and **wget** or **curl**. **pyenv** is optional — if missing, the script uses system Python 3.12+ automatically (or set `SKIP_PYENV=1`). If no `.env` exists, the script copies `.env.example` → `.env` on first run.
 
 ### Dependencies
 
@@ -137,7 +137,7 @@ Run training notebooks with the kernel’s **current working directory** set to 
 
 **Models and inference** use `src/encoder`, `src/llm`, `src/adapter`, and `src/adapter_llm_pipeline.py` — not copies under `training/utils/`.
 
-**Checkpoints** use `training.utils.checkpointing.save_checkpoint` (keys: `adapter_state_dict`, optional `gate_state_dict`, `optimizer_state_dict`, `scheduler_state_dict`, `metrics`, `hyperparams`). Serialize tuning bundles with `dataclasses.asdict` into `hyperparams`. Resume via `load_adapter_state_dict` or `torch.load` as in the stage trainers.
+**Checkpoints** use `training.utils.checkpointing.save_checkpoint` (keys: `adapter_state_dict`, optional `gate_state_dict`, `optimizer_state_dict`, `scheduler_state_dict`, `metrics`, `hyperparams`). Serialize tuning bundles with `dataclasses.asdict` into `hyperparams`. Resume via `load_adapter_state_dict` or `torch.load` as in the stage trainers. Stage 2 also writes **`checkpoints/adapter_stage2_step{N}.pt`** every **`SAVE_EVERY_STEPS`** (and updates `adapter_stage2.pt` for resume).
 
 **Metrics** (e.g. BLEU for transcript vs. model response) live in `training/utils/metrics.py` (requires `sacrebleu`).
 

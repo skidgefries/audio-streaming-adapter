@@ -28,13 +28,12 @@ sys.path.insert(0, _pkg_root)
 
 from src.adapter.streaming_adapter import StreamingAdapter
 from src.dataset import LibriSpeechPairs, load_mono_waveform_16k
-from src.encoder.waveform_window_encoder import WhisperWindowFeatureExtractor, unpack_encoder_window
-from training.utils.devices import llm_input_device
-from training.utils.env import env_int
-from training.utils.loaders import default_device_and_dtype, load_frozen_qwen_causal_lm
+from src.encoder.waveform_window_encoder import WhisperWindowFeatureExtractor
+from training.utils.devices import llm_input_device, resolve_device, visible_gpu_count
+from training.utils.env import env_int, load_project_env
+from training.utils.loaders import load_frozen_qwen_causal_lm
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEVICE, TORCH_DTYPE = default_device_and_dtype()
 
 WHISPER_DIM = 768
 LLM_DIM = 4096
@@ -44,32 +43,68 @@ LLM_MODEL_ID = "Qwen/Qwen3-8B"
 CHECKPOINT_PATH = "checkpoints/adapter_stage1.pt"
 # CHECKPOINT_PATH = "checkpoints/adapter_stage2.pt"
 TEST_CLEAN_ROOT = "datasets/librispeech_data/LibriSpeech/test-clean"
-NUM_UTTERANCES = env_int("RETRIEVAL_NLL_NUM_UTTERANCES", 100)
+NUM_UTTERANCES = env_int("RETRIEVAL_NLL_NUM_UTTERANCES", 2620)
 
 CANDIDATE_BATCH_SIZE = env_int("RETRIEVAL_NLL_BATCH_SIZE", 8)
 MAX_TEXT_TOKENS = 256
 
 
-def _maybe_autocast():
-    if torch.cuda.is_available():
+def _init_eval_device() -> tuple[torch.device, torch.dtype, int]:
+    """
+    Resolve ``DEVICE`` and touch only that CUDA device.
+
+    When ``DEVICE=cuda:1`` with ``CUDA_VISIBLE_DEVICES=0,1``, Whisper and Qwen
+    both load on logical ``cuda:1`` (physical GPU 1); ``cuda:0`` is left alone.
+    """
+    load_project_env(_pkg_root)
+    device = resolve_device()
+    num_cuda = visible_gpu_count()
+    torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    if device.type == "cuda":
+        torch.cuda.init()
+        torch.cuda.set_device(device)
+        torch.zeros((), device=device)
+        torch.cuda.empty_cache()
+    return device, torch_dtype, num_cuda
+
+
+def _assert_module_device(module: torch.nn.Module, device: torch.device, name: str) -> None:
+    param_device = next(module.parameters()).device
+    if param_device != device:
+        raise RuntimeError(f"{name} expected on {device}, found on {param_device}")
+
+
+def _maybe_autocast(device: torch.device):
+    if device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
 
 
-def _free_cuda(*objs: object) -> None:
+def _free_cuda(*objs: object, device: torch.device | None = None) -> None:
     for obj in objs:
         del obj
     gc.collect()
-    if torch.cuda.is_available():
+    if not torch.cuda.is_available():
+        return
+    if device is not None and device.type == "cuda":
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+    else:
         torch.cuda.empty_cache()
 
 
-def load_audio_encoder_and_adapter(checkpoint_path: str = CHECKPOINT_PATH):
+def load_audio_encoder_and_adapter(
+    *,
+    device: torch.device,
+    torch_dtype: torch.dtype,
+    checkpoint_path: str = CHECKPOINT_PATH,
+):
+    device_str = str(device)
     print("Loading Whisper...")
     audio = WhisperWindowFeatureExtractor(
         model_id=WHISPER_MODEL,
-        device=DEVICE,
-        torch_dtype=TORCH_DTYPE,
+        device=device_str,
+        torch_dtype=torch_dtype,
     )
 
     print("Loading adapter from checkpoint...")
@@ -84,31 +119,37 @@ def load_audio_encoder_and_adapter(checkpoint_path: str = CHECKPOINT_PATH):
         ema_alpha=0.8,
         learnable_ema=False,
         use_rate_controller=False,
-    ).to(DEVICE, dtype=torch.bfloat16)
+    ).to(device, dtype=torch_dtype)
 
-    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+    ckpt = torch.load(checkpoint_path, map_location=device)
     adapter.load_state_dict(ckpt["adapter_state_dict"])
     adapter.eval()
-    print(f"  Loaded checkpoint from epoch {ckpt['epoch']}, step {ckpt['global_step']}\n")
+    _assert_module_device(audio.whisper, device, "Whisper")
+    _assert_module_device(adapter, device, "Adapter")
+    print(f"  Loaded checkpoint from epoch {ckpt['epoch']}, step {ckpt['global_step']}")
+    print(f"  Whisper + adapter on {device}\n")
     return audio, adapter
 
 
-def load_llm():
+def load_llm(*, device: torch.device, torch_dtype: torch.dtype):
+    device_str = str(device)
     print("Loading Qwen causal LM...")
     qwen_models = load_frozen_qwen_causal_lm(
         model_id=LLM_MODEL_ID,
-        device=DEVICE,
-        torch_dtype=TORCH_DTYPE,
-        device_map="auto",
+        device=device_str,
+        torch_dtype=torch_dtype,
+        device_map=None,
     )
     llm = qwen_models.causal_lm
     llm_device = llm_input_device(llm)
-    print(f"  Qwen input device: {llm_device}\n")
+    if llm_device != device:
+        raise RuntimeError(f"Qwen expected on {device}, found on {llm_device}")
+    print(f"  Qwen causal LM on {llm_device}\n")
     return qwen_models.tokenizer, llm, qwen_models.embedder, llm_device
 
 
 @torch.no_grad()
-def compute_audio_prefix_tokens(audio_extractor, adapter, pairs):
+def compute_audio_prefix_tokens(audio_extractor, adapter, pairs, *, device: torch.device):
     audio_tokens_list = []
     kept_pairs = []
 
@@ -123,10 +164,9 @@ def compute_audio_prefix_tokens(audio_extractor, adapter, pairs):
 
         adapter.reset_streaming_state()
         chunks = []
-        with _maybe_autocast():
+        with _maybe_autocast(device):
             for w in windows:
-                enc, enc_mask = unpack_encoder_window(w)
-                out = adapter.forward_window(enc, encoder_attention_mask=enc_mask)
+                out = adapter.forward_window(w)
                 chunks.append(out["tokens"])
         audio_tokens = torch.cat(chunks, dim=1)
 
@@ -158,6 +198,7 @@ def nll_matrix(
     llm_device: torch.device,
     *,
     batch_size: int,
+    autocast_device: torch.device,
 ):
     """
     Returns an [N, N] matrix where entry (i, j) is the mean per-token NLL of text j
@@ -219,7 +260,7 @@ def nll_matrix(
             attn_prefix = torch.ones((b, a_len + 1), device=llm_device, dtype=torch.long)
             attn = torch.cat([attn_prefix, cand_mask], dim=1)
 
-            with _maybe_autocast():
+            with _maybe_autocast(autocast_device):
                 out = llm(inputs_embeds=inputs_embeds, attention_mask=attn)
                 logits = out.logits
 
@@ -260,8 +301,12 @@ def compute_recall_from_nll(nll_scores, ks=(1, 5, 10)):
 
 
 def main():
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    device, torch_dtype, num_cuda = _init_eval_device()
+
+    print(
+        f"Device: {device} (visible CUDA devices: {num_cuda}, "
+        f"single-GPU eval — Whisper then Qwen on {device})\n"
+    )
 
     print(f"Loading test-clean from {TEST_CLEAN_ROOT}...")
     dataset = LibriSpeechPairs(TEST_CLEAN_ROOT)
@@ -271,10 +316,12 @@ def main():
         f"(NLL batch={CANDIDATE_BATCH_SIZE}, max_text_tokens={MAX_TEXT_TOKENS})\n"
     )
 
-    audio, adapter = load_audio_encoder_and_adapter()
+    audio, adapter = load_audio_encoder_and_adapter(device=device, torch_dtype=torch_dtype)
 
     print("Computing audio prefix tokens...")
-    audio_tokens_list, kept_pairs = compute_audio_prefix_tokens(audio, adapter, pairs)
+    audio_tokens_list, kept_pairs = compute_audio_prefix_tokens(
+        audio, adapter, pairs, device=device
+    )
     if not audio_tokens_list:
         raise RuntimeError("No audio windows produced any prefix tokens; nothing to evaluate.")
 
@@ -282,9 +329,9 @@ def main():
     print(f"  Kept {len(texts)} utterances after filtering\n")
 
     print("Releasing Whisper and adapter before loading causal LM...")
-    _free_cuda(audio, adapter)
+    _free_cuda(audio, adapter, device=device)
 
-    tokenizer, llm, text_embedder, llm_device = load_llm()
+    tokenizer, llm, text_embedder, llm_device = load_llm(device=device, torch_dtype=torch_dtype)
 
     print("Tokenizing candidate transcripts...")
     input_ids, attention_mask = tokenize_candidates(tokenizer, texts)
@@ -298,6 +345,7 @@ def main():
         text_embedder,
         llm_device,
         batch_size=CANDIDATE_BATCH_SIZE,
+        autocast_device=device,
     )
 
     print("Computing retrieval metrics...")
