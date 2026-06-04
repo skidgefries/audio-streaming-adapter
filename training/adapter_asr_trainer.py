@@ -35,6 +35,7 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import nullcontext
+from dataclasses import dataclass
 
 _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _src_root = os.path.join(_pkg_root, "src")
@@ -66,7 +67,7 @@ if env_str("CHECK_TORCH_COMPAT", "0") in ("1", "true", "yes", "on"):
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 from src.adapter.streaming_adapter import StreamingAdapter
@@ -178,6 +179,8 @@ def _make_stage2_checkpoint(
     *,
     epoch: int,
     global_step: int,
+    samples_seen: int,
+    batch_size: int,
     adapter: torch.nn.Module,
     gate: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -193,12 +196,14 @@ def _make_stage2_checkpoint(
         optimizer_state_dict=optimizer.state_dict(),
         scheduler_state_dict=scheduler.state_dict(),
         metrics=metrics,
+        hyperparams={"batch_size": batch_size, "samples_seen": samples_seen},
     )
 
 
 def _maybe_save_step_checkpoint(
     *,
     epoch: int,
+    samples_seen: int,
     adapter: torch.nn.Module,
     gate: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -215,6 +220,8 @@ def _maybe_save_step_checkpoint(
     ckpt = _make_stage2_checkpoint(
         epoch=epoch + 1,
         global_step=step,
+        samples_seen=samples_seen,
+        batch_size=DATA.batch_size,
         adapter=adapter,
         gate=gate,
         optimizer=optimizer,
@@ -273,6 +280,117 @@ def _asr_forward_loss(
 
 def _unwrap(module: torch.nn.Module) -> torch.nn.Module:
     return module.module if isinstance(module, DDP) else module
+
+
+def _make_stage2_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    eta_min: float = 1e-5,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    """Linear warmup then linear decay to eta_min."""
+    warmup_steps = min(max(warmup_steps, 1), max(total_steps - 1, 1))
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    decay_steps = max(total_steps - warmup_steps, 1)
+    base_lr = optimizer.param_groups[0]["lr"]
+    end_factor = eta_min / base_lr if base_lr > 0 else 1.0
+    decay = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1.0,
+        end_factor=end_factor,
+        total_iters=decay_steps,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, decay],
+        milestones=[warmup_steps],
+    )
+
+
+@dataclass(frozen=True)
+class Stage2ResumeState:
+    """Where to continue in the dataloader (derived from utterances seen)."""
+
+    start_epoch: int = 0
+    skip_steps_in_epoch: int = 0
+    samples_seen: int = 0
+
+
+def _resume_stage2_if_present(
+    *,
+    save_path: str,
+    train_device: torch.device,
+    adapter: torch.nn.Module,
+    gate: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    pipeline: TrainingPipeline,
+    steps_per_epoch: int,
+    batch_size: int,
+) -> Stage2ResumeState:
+    """Restore weights; resume dataloader position from utterances seen (batch-size aware)."""
+    if not os.path.exists(save_path):
+        return Stage2ResumeState()
+
+    print(f"Resuming from checkpoint: {save_path}")
+    ckpt = torch.load(save_path, map_location=train_device)
+    _unwrap(adapter).load_state_dict(ckpt["adapter_state_dict"])
+    load_gate_state_dict_safe(_unwrap(gate), ckpt)
+    if ckpt.get("optimizer_state_dict") is not None:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except ValueError as exc:
+            print(
+                f"  [WARN] Could not load optimizer state ({exc}); "
+                "using fresh AdamW moments (adapter/gate weights still restored)."
+            )
+
+    pipeline.global_step = int(ckpt.get("global_step", 0))
+    hp = ckpt.get("hyperparams") or {}
+    ckpt_batch = int(hp.get("batch_size", 1)) or 1
+    samples_seen = int(hp.get("samples_seen", pipeline.global_step * ckpt_batch))
+    steps_per_epoch = max(steps_per_epoch, 1)
+    batches_done = samples_seen // max(batch_size, 1)
+    start_epoch = batches_done // steps_per_epoch
+    skip_steps = batches_done % steps_per_epoch
+    if ckpt_batch != batch_size:
+        print(
+            f"  [INFO] Checkpoint batch_size={ckpt_batch} -> current={batch_size}; "
+            f"resume at utterance {samples_seen} (batch {skip_steps + 1}/{steps_per_epoch} "
+            f"in epoch {start_epoch + 1})."
+        )
+
+    sched_sd = ckpt.get("scheduler_state_dict")
+    if sched_sd is not None:
+        try:
+            scheduler.load_state_dict(sched_sd)
+        except (ValueError, KeyError) as exc:
+            print(
+                f"  [WARN] Could not load scheduler state ({exc}); "
+                f"fast-forwarding {pipeline.global_step} scheduler steps instead."
+            )
+            for _ in range(pipeline.global_step):
+                scheduler.step()
+    elif pipeline.global_step > 0:
+        for _ in range(pipeline.global_step):
+            scheduler.step()
+
+    print(
+        f"  Resumed at epoch {start_epoch + 1}/{STAGE.epochs}, "
+        f"batch {skip_steps + 1}/{steps_per_epoch}, utterances {samples_seen}, "
+        f"global_step {pipeline.global_step}, lr={scheduler.get_last_lr()[0]:.2e}\n"
+    )
+    return Stage2ResumeState(
+        start_epoch=start_epoch,
+        skip_steps_in_epoch=skip_steps,
+        samples_seen=samples_seen,
+    )
 
 
 def train_smart_turn_gate(ctx, *, train_device, audio, adapter, gate, pipeline, optimizer, scheduler, logger) -> None:
@@ -472,12 +590,6 @@ def train() -> None:
 
     trainable_params = list(_unwrap(adapter).parameters()) + list(_unwrap(gate).parameters())
     optimizer = torch.optim.AdamW(trainable_params, lr=OPT.lr, weight_decay=OPT.weight_decay)
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer,
-        start_factor=0.1,
-        total_iters=OPT.warmup_steps,
-    )
-    pipeline = TrainingPipeline(optimizer=optimizer, scheduler=scheduler, grad_clip_norm=OPT.grad_clip_norm)
 
     if ctx.is_main:
         print(
@@ -495,6 +607,12 @@ def train() -> None:
         sampler=sampler,
         num_workers=DATA.num_workers,
     )
+
+    total_steps = max(STAGE.epochs * len(dataloader), 1)
+    scheduler = _make_stage2_lr_scheduler(
+        optimizer, total_steps=total_steps, warmup_steps=OPT.warmup_steps
+    )
+    pipeline = TrainingPipeline(optimizer=optimizer, scheduler=scheduler, grad_clip_norm=OPT.grad_clip_norm)
 
     if ctx.is_main:
         os.makedirs(os.path.dirname(SAVE_PATH), exist_ok=True)
@@ -516,20 +634,22 @@ def train() -> None:
         },
     )
 
-    start_epoch = 0
-    if ctx.is_main and os.path.exists(SAVE_PATH):
-        print(f"Resuming from checkpoint: {SAVE_PATH}")
-        ckpt = torch.load(SAVE_PATH, map_location=train_device)
-        _unwrap(adapter).load_state_dict(ckpt["adapter_state_dict"])
-        load_gate_state_dict_safe(_unwrap(gate), ckpt)
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = ckpt["epoch"]
-        pipeline.global_step = ckpt["global_step"]
-        for _ in range(pipeline.global_step):
-            scheduler.step()
-        print(f"  Resumed at epoch {start_epoch}, global_step {pipeline.global_step}\n")
+    if ctx.is_main:
+        resume = _resume_stage2_if_present(
+            save_path=SAVE_PATH,
+            train_device=train_device,
+            adapter=adapter,
+            gate=gate,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            pipeline=pipeline,
+            steps_per_epoch=len(dataloader),
+            batch_size=DATA.batch_size,
+        )
     else:
-        start_epoch = 0
+        resume = Stage2ResumeState()
+
+    samples_seen = resume.samples_seen
 
     if ctx.is_main:
         print("\nStarting Stage 2 training: ASR Distillation")
@@ -551,7 +671,8 @@ def train() -> None:
             )
         print(f"  Epochs: {STAGE.epochs}")
         print(f"  Batch size: {DATA.batch_size}")
-        print(f"  Learning rate: {OPT.lr}")
+        print(f"  Learning rate: {OPT.lr} (warmup {OPT.warmup_steps} steps, then linear to 1e-6)")
+        print(f"  LR schedule total steps: {total_steps}")
         print(f"  λ_align: {STAGE.lambda_align}")
         print(f"  λ_stability: {STAGE.lambda_stability}")
         print(f"  λ_rate: {STAGE.lambda_rate}")
@@ -587,7 +708,7 @@ def train() -> None:
         cleanup_distributed()
         return
 
-    for epoch in range(start_epoch, STAGE.epochs):
+    for epoch in range(resume.start_epoch, STAGE.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
 
@@ -602,7 +723,26 @@ def train() -> None:
         if ctx.is_main:
             print(f"\n{'=' * 60}\nEpoch {epoch + 1}/{STAGE.epochs}\n{'=' * 60}\n")
 
-        for step, batch in enumerate(dataloader):
+        steps_per_epoch = max((len(dataset) + DATA.batch_size - 1) // DATA.batch_size, 1)
+        skip_batches = resume.skip_steps_in_epoch if epoch == resume.start_epoch else 0
+        sample_offset = resume.samples_seen if epoch == resume.start_epoch else 0
+        epoch_dataset: Dataset = dataset
+        if sample_offset > 0:
+            epoch_dataset = Subset(dataset, range(sample_offset, len(dataset)))
+            if ctx.is_main:
+                print(
+                    f"Resuming epoch {epoch + 1} at batch {skip_batches + 1}/{steps_per_epoch} "
+                    f"(utterance {sample_offset + 1}/{len(dataset)}, global_step {pipeline.global_step})\n"
+                )
+        epoch_loader = DataLoader(
+            epoch_dataset,
+            batch_size=DATA.batch_size,
+            shuffle=sampler is None and skip_batches == 0,
+            sampler=None if skip_batches > 0 else sampler,
+            num_workers=DATA.num_workers,
+        )
+
+        for step, batch in enumerate(epoch_loader, start=skip_batches):
             audio_paths, transcriptions = batch
             batch_texts = list(transcriptions)
 
@@ -759,6 +899,7 @@ def train() -> None:
             )
 
             pipeline.step(total_loss, trainable_params)
+            samples_seen += len(audio_paths)
 
             m_total.update(total_loss.item())
             m_asr.update(asr_loss.item())
@@ -771,7 +912,8 @@ def train() -> None:
             if ctx.is_main and step % 1 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 print(
-                    f"Step {step:4d}/{len(dataloader)} | Loss: {total_loss.item():.4f} | "
+                    f"Step {pipeline.global_step:5d}/{total_steps} "
+                    f"(epoch {epoch + 1} batch {step + 1}/{len(dataloader)}) | Loss: {total_loss.item():.4f} | "
                     f"ASR: {asr_loss.item():.4f} | Align: {align_loss.item():.4f} | "
                     f"Stab: {stability_loss.float().item():.4f} | "
                     f"Rate: {rate_loss.item():.4f} | Gate: {gate_loss_mean.float().item():.4f} | "
@@ -831,6 +973,7 @@ def train() -> None:
             if ctx.is_main:
                 _maybe_save_step_checkpoint(
                     epoch=epoch,
+                    samples_seen=samples_seen,
                     adapter=adapter,
                     gate=gate,
                     optimizer=optimizer,
@@ -853,6 +996,8 @@ def train() -> None:
                 _make_stage2_checkpoint(
                     epoch=epoch + 1,
                     global_step=pipeline.global_step,
+                    samples_seen=samples_seen,
+                    batch_size=DATA.batch_size,
                     adapter=adapter,
                     gate=gate,
                     optimizer=optimizer,
@@ -867,6 +1012,8 @@ def train() -> None:
                 _make_stage2_checkpoint(
                     epoch=epoch + 1,
                     global_step=pipeline.global_step,
+                    samples_seen=samples_seen,
+                    batch_size=DATA.batch_size,
                     adapter=adapter,
                     gate=gate,
                     optimizer=optimizer,

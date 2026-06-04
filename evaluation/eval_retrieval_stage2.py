@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -25,11 +26,21 @@ from src.adapter.streaming_adapter import StreamingAdapter
 from src.dataset import LibriSpeechPairs, load_mono_waveform_16k
 from src.encoder.waveform_window_encoder import WhisperWindowFeatureExtractor
 from training.utils.config import Stage2Config
-from training.utils.loaders import default_device_and_dtype, load_frozen_qwen_embeddings
+from training.utils.devices import TrainingContext, llm_device_map, llm_input_device, resolve_device
+from training.utils.env import env_int, load_project_env
+from training.utils.loaders import load_frozen_qwen_embeddings
 
-# ── Config ────────────────────────────────────────────────────────────────────
-DEVICE, TORCH_DTYPE = default_device_and_dtype()
 STAGE2 = Stage2Config.from_env()
+
+
+def _torch_dtype_for(device: torch.device) -> torch.dtype:
+    return torch.bfloat16 if device.type == "cuda" else torch.float32
+
+
+def _maybe_autocast(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
 
 WHISPER_DIM = 768
 LLM_DIM = 4096
@@ -43,22 +54,44 @@ TEST_CLEAN_ROOT = os.path.join(
 NUM_UTTERANCES = 2620
 
 
-def load_models(checkpoint_path: str = CHECKPOINT_PATH):
+def _qwen_max_memory() -> dict[int, str] | None:
+    """Cap GPU use for Qwen (e.g. ``QWEN_MAX_CUDA_GIB=6`` → ~5–7 GB on device 0)."""
+    gib = env_int("QWEN_MAX_CUDA_GIB", 0)
+    if gib <= 0:
+        return None
+    return {0: f"{gib}GiB"}
+
+
+def load_models(
+    checkpoint_path: str = CHECKPOINT_PATH,
+    *,
+    device: torch.device,
+    torch_dtype: torch.dtype,
+    llm_map: str | None,
+):
+    max_memory = _qwen_max_memory() if device.type == "cuda" else None
+    if max_memory:
+        print(f"  Qwen max CUDA memory: {max_memory[0]}")
+
+    device_str = str(device)
     print("Loading Whisper...")
     audio = WhisperWindowFeatureExtractor(
         model_id=WHISPER_MODEL,
-        device=DEVICE,
-        torch_dtype=TORCH_DTYPE,
+        device=device_str,
+        torch_dtype=torch_dtype,
     )
 
     print("Loading Qwen embedder...")
     qwen_models = load_frozen_qwen_embeddings(
         model_id=LLM_MODEL_ID,
-        device=DEVICE,
-        torch_dtype=TORCH_DTYPE,
-        device_map="auto",
+        device=device_str,
+        torch_dtype=torch_dtype,
+        device_map=llm_map,
+        max_memory=max_memory,
     )
+    llm_device = llm_input_device(qwen_models.embedder)
 
+    adapter_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print("Loading Stage 2 adapter from checkpoint...")
     adapter = StreamingAdapter(
         d_encoder=WHISPER_DIM,
@@ -73,9 +106,9 @@ def load_models(checkpoint_path: str = CHECKPOINT_PATH):
         use_rate_controller=STAGE2.use_rate_controller,
         rate_threshold=0.5,
         target_rate=STAGE2.rate_target,
-    ).to(DEVICE, dtype=torch.bfloat16)
+    ).to(device, dtype=adapter_dtype)
 
-    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     adapter.load_state_dict(ckpt["adapter_state_dict"])
     adapter.eval()
     print(
@@ -84,11 +117,13 @@ def load_models(checkpoint_path: str = CHECKPOINT_PATH):
         f"rate_controller={STAGE2.use_rate_controller} target_rate={STAGE2.rate_target}\n"
     )
 
-    return audio, qwen_models.tokenizer, qwen_models.embedder, adapter
+    return audio, qwen_models.tokenizer, qwen_models.embedder, adapter, llm_device
 
 
 @torch.no_grad()
-def compute_embeddings(audio_extractor, tokenizer, text_embedder, adapter, pairs):
+def compute_embeddings(
+    audio_extractor, tokenizer, text_embedder, adapter, pairs, *, device: torch.device, llm_device
+):
     audio_vecs = []
     text_vecs = []
 
@@ -103,7 +138,7 @@ def compute_embeddings(audio_extractor, tokenizer, text_embedder, adapter, pairs
 
         adapter.reset_streaming_state()
         chunks = []
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with _maybe_autocast(device):
             for w in windows:
                 out = adapter.forward_window(w)
                 chunks.append(out["tokens"])
@@ -118,8 +153,8 @@ def compute_embeddings(audio_extractor, tokenizer, text_embedder, adapter, pairs
             padding=True,
             truncation=True,
             max_length=STAGE2.max_text_tokens,
-        ).to(DEVICE)
-        label_embeds = text_embedder(text_tokens.input_ids).float()
+        )
+        label_embeds = text_embedder(text_tokens.input_ids.to(llm_device)).float()
         text_pooled = label_embeds.mean(dim=1)
         text_vecs.append(text_pooled.squeeze(0).cpu())
 
@@ -150,18 +185,44 @@ def compute_recall(audio_bank, text_bank, ks=(1, 5, 10)):
 
 
 def main():
-    torch.cuda.empty_cache()
+    load_project_env(_pkg_root)
+    device = resolve_device()
+    torch_dtype = _torch_dtype_for(device)
+    ctx = TrainingContext(
+        device=device,
+        rank=0,
+        world_size=1,
+        local_rank=0,
+        is_main=True,
+        num_cuda_devices=0 if device.type == "cpu" else torch.cuda.device_count(),
+        model_parallel=device.type == "cuda" and torch.cuda.device_count() >= 2,
+    )
+    llm_map = llm_device_map(ctx)
+
+    print(f"Device: {device} (Qwen device_map: {llm_map!r})")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     print(f"Loading test-clean from {TEST_CLEAN_ROOT}...")
     dataset = LibriSpeechPairs(TEST_CLEAN_ROOT)
     pairs = dataset.pairs[:NUM_UTTERANCES]
     print(f"Evaluating on {len(pairs)} utterances\n")
 
-    audio, tokenizer, text_embedder, adapter = load_models()
+    audio, tokenizer, text_embedder, adapter, llm_device = load_models(
+        device=device,
+        torch_dtype=torch_dtype,
+        llm_map=llm_map,
+    )
 
     print("Computing embeddings...")
     audio_bank, text_bank = compute_embeddings(
-        audio, tokenizer, text_embedder, adapter, pairs
+        audio,
+        tokenizer,
+        text_embedder,
+        adapter,
+        pairs,
+        device=device,
+        llm_device=llm_device,
     )
     print(f"  Audio bank: {audio_bank.shape}")
     print(f"  Text bank:  {text_bank.shape}\n")
