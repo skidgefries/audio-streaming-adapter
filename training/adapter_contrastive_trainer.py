@@ -129,7 +129,7 @@ def train():
     adapter = StreamingAdapter(
         d_encoder=WHISPER_DIM,
         d_llm=LLM_DIM,
-        num_queries=4,
+        num_queries=2,
         num_layers=2,
         num_heads=4,
         d_ffn=2048,

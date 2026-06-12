@@ -5,7 +5,7 @@ Reuses `training.utils.losses`, `training.utils.optimization`, `dataset`, and Wh
 
 ``L_gate`` is the turn-end commit gate loss (:class:`adapter.turn_end_commit_gate.TurnEndCommitGate`),
 not the adapter rate-controller gates. For inference aligned with this trainer, use
-``WhisperAdapterLLMCommitGatePipeline`` in ``adapter_llm_pipeline.py``. See ``docs/EARLY_COMMIT.md``.
+``WhisperAdapterLLMCommitGatePipeline`` in ``adapter_llm_pipeline.py``. See ``docs/AUDIO_STREAM.md`` §7.
 
 # Previous gate import (reference):
 # from src.adapter.early_commit_gate import EarlyCommitGate
@@ -159,7 +159,7 @@ def train() -> None:
     adapter = StreamingAdapter(
         d_encoder=WHISPER_DIM,
         d_llm=4096,
-        num_queries=4,
+        num_queries=2,
         num_layers=2,
         num_heads=4,
         d_ffn=2048,

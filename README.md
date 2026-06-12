@@ -66,7 +66,9 @@ bash scripts/setup_remote_training.sh
 
 Setup only (no training): set `SKIP_TRAINING=1` in `.env`. Skip model cache warmup with `SKIP_MODEL_PREFETCH=1`.
 
-**GPUs:** with two visible GPUs (`CUDA_VISIBLE_DEVICES=0,1`), Stage 2 auto-shards the frozen Qwen across devices (`device_map="auto"`). Set `DEVICE=cpu` to force CPU. See `training/utils/config.py` (`DeviceConfig`).
+**GPUs:** with two visible GPUs (`CUDA_VISIBLE_DEVICES=0,1`), Stage 2 loads Whisper on GPU 0, then Qwen (`device_map="auto"` by default, or `sequential` when `LLM_MAX_MEMORY` is set so GPU 0 fills first and overflow spills to GPU 1). Set `LLM_MAX_MEMORY=0:14GiB,1:5GiB` to cap spill on a shared GPU. Set `DEVICE=cpu` to force CPU. See `training/utils/config.py` (`DeviceConfig`).
+
+**GPU reservation:** training/eval entry points use exclusive file locks on visible GPUs (`training/utils/gpu_reservation.py`). While a run holds a lock, other processes that use `init_training_context()` or `init_eval_device()` **block** until it exits. `adapter_asr_only_trainer.py` enables this by default (`GPU_LOCK=true`). Disable with `GPU_LOCK=off`. Lock files live under `.gpu_locks/` (override with `GPU_LOCK_DIR`).
 
 Requires **uv** and **wget** or **curl**. **pyenv** is optional — if missing, the script uses system Python 3.12+ automatically (or set `SKIP_PYENV=1`). If no `.env` exists, the script copies `.env.example` → `.env` on first run.
 
@@ -212,7 +214,7 @@ uv run python training/adapter_contrastive_trainer.py
 
 **What it does:** Keeps speech content while training compression / optional rate controller and gate losses (`training/adapter_asr_trainer.py`).
 
-**CLI (two GPUs recommended for Qwen3-8B):** All trainable modules and Whisper use CUDA (`DEVICE=cuda` by default). With two or more visible GPUs, the frozen Qwen model is sharded automatically via HuggingFace `device_map="auto"` — no manual memory fractions.
+**CLI (two GPUs recommended for Qwen3-8B):** Whisper, adapter, and gate use GPU 0 (`DEVICE=cuda` by default). With two or more visible GPUs, the frozen Qwen model is loaded via HuggingFace `device_map="auto"` (balanced shard). Set `LLM_MAX_MEMORY` (e.g. `0:14GiB,1:5GiB`) to use `device_map="sequential"`: fill GPU 0 first, spill overflow to GPU 1 with a per-GPU cap — useful when GPU 1 is shared with another process.
 
 ```bash
 cd audio-streaming-adapter
@@ -221,6 +223,9 @@ uv run training/adapter_asr_trainer.py
 
 # multi-GPU (2+ visible devices)
 torchrun --standalone --nnodes=1 --nproc_per_node=1 training/adapter_asr_trainer.py
+
+# shared GPU 1 (5GiB cap for training spill)
+LLM_MAX_MEMORY=0:14GiB,1:5GiB uv run training/adapter_asr_trainer.py
 ```
 
 On a single GPU, set `CUDA_VISIBLE_DEVICES=0` or leave one device visible. If training OOMs, enable `ENABLE_LLM_GRADIENT_CHECKPOINTING=true`, lower `MAX_WINDOWS_PER_UTT`, or reduce `BATCH_SIZE`.
@@ -236,24 +241,81 @@ Each stage uploads only its own epoch files (`adapter_stage1_epoch{N}.pt`, `adap
 
 **Walkthrough:** `notebooks/training_stage2_asr.ipynb` — follow cells top-to-bottom; align hyperparameters with `Stage2Config`, `DeviceConfig`, `OptimConfig`, and constants at the top of `adapter_asr_trainer.py`.
 
-### Evaluation: LibriSpeech ASR (WER / BLEU-4)
+### Evaluation (LibriSpeech test-clean)
 
-`evaluation/eval_librispeech_asr_metrics.py` runs end-to-end transcription on test-clean and reports **avg WER** and **corpus BLEU-4** (same style as SALMONN `eval_librispeech_full_metrics.py`, ASR section only).
+Two entry scripts — pick the stage, then pick the metric with `--metric`:
 
-- **Stage 1:** `WhisperAdapterLLMPipeline`, checkpoint from `adapter_contrastive_trainer.py` (`use_rate_controller=False`).
-- **Stage 2:** `WhisperAdapterLLMCommitGatePipeline`, checkpoint from `adapter_asr_trainer.py` (rate controller + early-commit gate). Training CE uses **`[audio tokens | im_end | teacher-forced transcript]`**; default ASR eval for stages **1–2** uses **`audio tokens → generate`** (do not append im_end at inference — Qwen3 treats it as chat). Chat tails after a blank line are trimmed. **`--prompt-asr`** switches to prompt+audio (`--asr-prompt`, chat template, `enable_thinking=False`) — the Stage 3 target path. Optional `--early-commit-truncation` for stage 2.
+| Script | Stage | Metrics (`--metric`) |
+|--------|-------|----------------------|
+| `evaluation/eval_stage1.py` | 1 (contrastive) | `retrieval-cosine`, `retrieval-nll`, `asr` |
+| `evaluation/eval_stage2.py` | 2 (ASR distillation) | `retrieval-cosine`, `retrieval-nll`, `asr` |
+
+Shared flags: `--checkpoint`, `--dataset-root`, `--num-samples` (integer or `all`), `--run-name`, `--output-dir`. Outputs go under `outputs/experiments/{RUN_NAME}/`.
+
+**ASR** (`--metric asr`): avg WER + corpus BLEU-4. Stage 1 uses `WhisperAdapterLLMPipeline`; stage 2 uses `WhisperAdapterLLMCommitGatePipeline` (rate controller + gate). Default prefix is train-style **`[audio | im_end/BOS] → generate`** (`--append-im-end`). Use `--no-append-im-end`, `--compare-im-end`, or `--prompt-asr` (Stage 3 path). Stage 2: optional `--early-commit-truncation`.
+
+**Retrieval cosine** (`--metric retrieval-cosine`): R@1, R@5, R@10 via centered cosine similarity → `retrieval_cosine.json`.
+
+**Retrieval NLL** (`--metric retrieval-nll`): R@1, R@5, R@10 via frozen Qwen NLL (slow; `--resume` / `--rank-only` supported) → `retrieval_nll.json`.
 
 ```bash
 cd audio-streaming-adapter
-# Compare stage 1 vs stage 2 (writes outputs/asr_eval/asr_comparison.json)
-CUDA_VISIBLE_DEVICES=1 uv run evaluation/eval_librispeech_asr_metrics.py --compare-stages
 
-# Single checkpoint
-uv run evaluation/eval_librispeech_asr_metrics.py \
-  --checkpoint checkpoints/adapter_stage2.pt --stage 2 --num-samples 50
+# Stage 1 retrieval (quick)
+uv run evaluation/eval_stage1.py --metric retrieval-cosine --num-samples 100
+
+# Stage 2 ASR on 50 utterances
+uv run evaluation/eval_stage2.py --metric asr --num-samples 50
+
+# Stage 2 full test-clean NLL (resumable)
+uv run evaluation/eval_stage2.py --metric retrieval-nll --num-samples all
+
+# Full experiment suite (all metrics × all checkpoints)
+bash scripts/run_experiment_suite.sh
+
+# Stage 2 im_end ablation
+bash scripts/run_im_end_ablation.sh
 ```
 
-Retrieval-only scripts remain under `evaluation/eval_retrieval*.py`.
+### Experiment suite (eval + ablation)
+
+Run the full pipeline (baseline evals → gate training → ASR ablations → ablation evals):
+
+```bash
+cd audio-streaming-adapter
+bash scripts/run_experiment_suite.sh
+```
+
+**GPU layout:** `CUDA_VISIBLE_DEVICES=0,1`, `LLM_MAX_MEMORY=0:14GiB,1:5GiB` (GPU 0 full, GPU 1 capped at 5GiB for Qwen spill).
+
+| Step | `RUN_NAME` | Checkpoint | Eval `--stage` |
+|------|------------|------------|------------------|
+| 1 | `stage1_baseline` | `checkpoints/adapter_stage1.pt` | 1 |
+| 2a | `stage2_epoch1` | `checkpoints/adapter_stage2_epoch1.pt` | 2 |
+| 2b | `stage2_last` | `checkpoints/adapter_stage2.pt` | 2 |
+| 3 | `gate_smart_turn` | `checkpoints/gate_smart_turn.pt` | (train only) |
+| 4a | `asr_only_1ep` | `checkpoints/adapter_asr_only_1ep.pt` | 1 |
+| 4b | `asr_plus_gate_1ep` | `checkpoints/adapter_asr_plus_gate_1ep.pt` | 2 |
+
+**Outputs per run:** `outputs/experiments/{RUN_NAME}/asr_metrics.json`, `retrieval_cosine.json`, `retrieval_nll.json`
+
+**Logs:** `logs/experiments/{TIMESTAMP}/` plus `summary.json`
+
+**Gate training** (standalone, Smart Turn labels):
+
+```bash
+GATE_LABEL_SOURCE=smart_turn EPOCHS=5 CHECKPOINT_BASENAME=gate_smart_turn \
+  ADAPTER_CHECKPOINT=checkpoints/adapter_stage1.pt \
+  uv run training/gate_training.py
+```
+
+**ASR ablation env vars** (used by `adapter_asr_trainer.py`):
+
+- `LOAD_STAGE1_CHECKPOINT=false` — random-init adapter
+- `TRAIN_GATE=false` — skip gate in training loop
+- `GATE_CHECKPOINT=checkpoints/gate_smart_turn.pt` — load frozen gate for checkpoint save / Stage 2 eval
+- `CHECKPOINT_BASENAME=adapter_asr_only_1ep` — custom checkpoint filename
+- Set `LAMBDA_ALIGN/STABILITY/RATE/GATE=0` for ASR-only loss
 
 ### Stage 3: Task distillation
 
@@ -327,9 +389,24 @@ LLM decoding uses a **deep copy** of the model’s `GenerationConfig`. Default *
 
 For extra detail on generation behavior, set the environment variable **`TRANSFORMERS_VERBOSITY=info`** before importing `transformers` (e.g. in the notebook: `os.environ.setdefault("TRANSFORMERS_VERBOSITY", "info")`).
 
+**Step-by-step logging:** pass `verbose=True` (or a custom `PipelineStepLogger(enabled=True)`) when constructing `WhisperAdapterLLMPipeline` / `WhisperAdapterLLMCommitGatePipeline`. Each `generate()` call logs encode → window selection → adapter → gate (stage 2) → LLM decode with tensor shapes and timings. The result dict includes `pipeline_trace` when logging is enabled.
+
+**Stage-2 smoke test (one dataset sample, all checkpoints):** runs the full commit-gate pipeline on one LibriSpeech utterance for every `checkpoints/adapter_stage2*.pt`:
+
+```bash
+cd audio-streaming-adapter
+uv run python src/adapter_llm_pipeline.py \
+  --checkpoints-dir checkpoints \
+  --dataset-root datasets/librispeech_data/LibriSpeech/test-clean \
+  --sample-index 0 \
+  --output-json outputs/experiments/stage2_smoke_test.json
+```
+
+Defaults to **`--device cpu`**. For GPU: `--device cuda` or `--device cuda:0`. Use `--n-windows 4` for a faster smoke test; default `--n-windows -1` uses all adapter windows (slow on long utterances). Each checkpoint reports **WER** (decode vs. reference) and **NLL** (teacher-forcing loss on the reference transcript, same path as Stage-2 training).
+
 ### Streaming KV-cache inference (Qwen3-8B)
 
-`WhisperAdapterLLMCommitGatePipeline.generate_streaming()` and `WhisperAdapterStreamingSession` (`src/adapter_llm_streaming.py`) implement the live path documented in `docs/EARLY_COMMIT.md`:
+`WhisperAdapterLLMCommitGatePipeline.generate_streaming()` and `WhisperAdapterStreamingSession` (`src/adapter_llm_streaming.py`) implement the live path documented in `docs/AUDIO_STREAM.md` §4.1 and §7:
 
 1. Each 0.8s / 0.4s window → adapter compressed tokens → **append to Qwen3-8B KV-cache** (`LlmKvCacheSession`)
 2. `TurnEndCommitGate` on accumulated tokens each window
@@ -526,8 +603,10 @@ STRIDE_FRAMES = 40        # 0.8s (no overlap)
 ### Common Issues
 
 **Out of Memory Errors:**
-- Reduce batch size in training scripts
-- Use gradient accumulation instead of larger batches
+- Reduce `BATCH_SIZE` (micro-batch per forward pass) in `.env`
+- Set `MACRO_BATCH_SIZE` to the desired effective batch; the trainer accumulates
+  `MACRO_BATCH_SIZE / BATCH_SIZE` micro-batches before each optimizer step
+  (e.g. `BATCH_SIZE=2`, `MACRO_BATCH_SIZE=16` → 8 accumulation steps)
 - Process fewer files in batch mode
 
 **Poor Summarization Quality:**
@@ -588,7 +667,7 @@ We welcome contributions! Areas of interest:
 
 - [BLIP-2 Paper](https://arxiv.org/abs/2301.12597) (Q-Former architecture)
 - [Whisper Model](https://arxiv.org/abs/2212.04356)
-- [Streaming Audio Processing](../../docs/phase2_cross_attention_adapter.md)
+- [Audio Streaming Adapter — Research & Implementation](docs/AUDIO_STREAM.md)
 
 ## Contact
 

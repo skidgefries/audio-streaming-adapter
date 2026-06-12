@@ -139,7 +139,7 @@ def check_model_init():
         adapter = StreamingAdapter(
             d_encoder=1024,
             d_llm=2560,
-            num_queries=4,
+            num_queries=2,
             num_layers=2,
             num_heads=4,
             d_ffn=2048,
@@ -153,7 +153,7 @@ def check_model_init():
         adapter_rc = StreamingAdapter(
             d_encoder=1024,
             d_llm=2560,
-            num_queries=4,
+            num_queries=2,
             use_rate_controller=True,
             target_rate=2.0,
         ).to(device, dtype=torch.float16)

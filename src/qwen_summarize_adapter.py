@@ -132,7 +132,7 @@ def qwen_summarize_single_file(file_path: str) -> dict[str, str]:
             adapter_output = streaming_adapter(windows)
 
         compressed_tokens = adapter_output["tokens"]  # (1, num_windows * num_queries, 4096)
-        num_windows = len(windows)
+        num_windows = len()
         num_tokens = compressed_tokens.shape[1]
 
         print(f"  ✓ Compressed to {num_tokens} tokens from {num_windows} windows")

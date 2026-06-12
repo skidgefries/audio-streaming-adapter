@@ -9,7 +9,7 @@ Silence modes (``silence_mode``):
   - ``learned``: trainable :class:`LearnedSilenceHead` on Z_t
   - ``both``: run both paths in parallel for comparison / dual training
 
-See ``docs/EARLY_COMMIT.md`` and ``docs/AUDIO_STREAM.md`` §6.1.
+See ``docs/AUDIO_STREAM.md`` §7.
 """
 
 from __future__ import annotations

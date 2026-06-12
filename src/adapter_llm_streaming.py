@@ -99,6 +99,7 @@ class WhisperAdapterStreamingSession:
         self._silence_tracker = None
         self._learned_silence_tracker = None
         self._train_style_asr = False
+        self._train_style_sep_appended = False
 
     def begin(
         self,
@@ -112,8 +113,8 @@ class WhisperAdapterStreamingSession:
 
         Args:
             prompt: User prompt (chat template). Ignored when ``train_style_asr=True``.
-            train_style_asr: Audio-only prefix, matching stage 1–2 eval (no chat prompt).
-            total_windows_hint: Expected window count for gate normalization; optional for live streams.
+            train_style_asr: ``[audio | im_end/BOS]`` prefix, matching stage 1–2 eval/training.
+            total__hint: Expected window count for gate normalization; optional for live streams.
         """
         self.streaming_adapter.reset_streaming_state()
         self._kv.reset()
@@ -128,6 +129,7 @@ class WhisperAdapterStreamingSession:
         self._first_token_time_s = None
         self._session_start = time.time()
         self._train_style_asr = train_style_asr
+        self._train_style_sep_appended = False
 
         gate = self.early_commit_gate
         self._silence_tracker = (
@@ -312,6 +314,7 @@ class WhisperAdapterStreamingSession:
                 tokenize=True,
                 return_tensors="pt",
                 add_generation_prompt=True,
+                enable_thinking=False,
             )
             return batch.input_ids.to(self.device)
         return tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
@@ -329,6 +332,19 @@ class WhisperAdapterStreamingSession:
     ) -> None:
         if self._session_start is not None and self._first_token_time_s is None:
             self._first_token_time_s = time.time() - self._session_start
+
+        if self._train_style_asr and not self._train_style_sep_appended:
+            sep_id = WhisperAdapterLLMPipeline.train_style_separator_token_id(self.llm_tokenizer)
+            sep_ids = torch.tensor([[sep_id]], device=self._kv._input_device, dtype=torch.long)
+            sep_embed = self.llm_model.get_input_embeddings()(sep_ids).to(
+                device=self._kv._input_device, dtype=self.torch_dtype
+            )
+            no_think_embed = WhisperAdapterLLMPipeline.qwen_no_think_suffix_embeds(
+                self.llm_model, self._kv._input_device, self.torch_dtype
+            )
+            self._kv.append_embeddings(sep_embed)
+            self._kv.append_embeddings(no_think_embed)
+            self._train_style_sep_appended = True
 
         gen_ids = self._kv.generate(
             self.llm_tokenizer,

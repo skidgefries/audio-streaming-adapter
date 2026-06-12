@@ -40,7 +40,7 @@ class StreamingAdapter(nn.Module):
     Args:
         d_encoder: Whisper encoder output dimension (1024 for whisper-medium).
         d_llm: Target LLM embedding dimension.
-        num_queries: Maximum number of compressed tokens per window (m=1-4).
+        num_queries: Maximum number of compressed tokens per window (m=1-2 default).
         num_layers: Number of stacked Q-Former layers.
         num_heads: Number of attention heads per Q-Former layer.
         d_ffn: FFN hidden dimension in Q-Former layers.
@@ -64,7 +64,7 @@ class StreamingAdapter(nn.Module):
         self,
         d_encoder: int = 1024,
         d_llm: int = 2560,
-        num_queries: int = 4,
+        num_queries: int = 2,
         num_layers: int = 2,
         num_heads: int = 4,
         d_ffn: int = 2048,
@@ -202,7 +202,7 @@ class StreamingAdapter(nn.Module):
         encoder_features_sequence: list[torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         """
-        Process a full sequence of windows (training mode).
+        Process a full sequence of  (training mode).
 
         Args:
             encoder_features_sequence: List of (batch, T, d_encoder) tensors,

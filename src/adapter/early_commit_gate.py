@@ -7,7 +7,7 @@ The mean-pool early-commit gate has been superseded by
 Smart Turn-style attention-pool + classifier on accumulated adapter tokens
 and serves as the integrated turn-end / VAD replacement in the unified pipeline.
 
-See ``docs/EARLY_COMMIT.md`` and ``turn_end_commit_gate.py``.
+See ``docs/AUDIO_STREAM.md`` §7 and ``turn_end_commit_gate.py``.
 
 -------------------------------------
 

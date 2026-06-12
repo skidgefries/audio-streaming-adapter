@@ -27,6 +27,7 @@ class LlmGenerationParams:
     """
 
     max_new_tokens: int = 100
+    min_new_tokens: int | None = None
     do_sample: bool = True
     num_beams: int = 1
 
@@ -59,6 +60,8 @@ def build_hf_generation_config(
         "max_new_tokens": int(params.max_new_tokens),
         "do_sample": bool(params.do_sample),
     }
+    if params.min_new_tokens is not None:
+        cfg_kwargs["min_new_tokens"] = int(params.min_new_tokens)
     if eos_id is not None:
         cfg_kwargs["eos_token_id"] = eos_id
         cfg_kwargs["pad_token_id"] = eos_id

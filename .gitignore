@@ -90,3 +90,4 @@ checkpoints/
 
 # Misc
 .qodo/
+.gpu_locks/

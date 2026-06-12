@@ -32,6 +32,7 @@ class CheckpointConfig:
     dir: str = "checkpoints"
     save_every_steps: int | None = None
     save_every_epochs: int = 1
+    resume_checkpoint: str | None = None
 
     @classmethod
     def from_env(cls, *, pkg_root: str | None = None) -> CheckpointConfig:
@@ -41,10 +42,14 @@ class CheckpointConfig:
         save_every_steps = env_optional_int("SAVE_EVERY_STEPS")
         if save_every_steps is None:
             save_every_steps = env_optional_int("CHECKPOINT_SAVE_EVERY_STEPS")
+        resume = env_str("RESUME_CHECKPOINT")
+        if resume and pkg_root and not os.path.isabs(resume):
+            resume = os.path.join(pkg_root, resume)
         return cls(
             dir=ckpt_dir,
             save_every_steps=save_every_steps,
             save_every_epochs=env_int("CHECKPOINT_SAVE_EVERY_EPOCHS", 1),
+            resume_checkpoint=resume,
         )
 
 
@@ -81,7 +86,7 @@ class OptimConfig:
             lr=env_float("LEARNING_RATE", 5e-5),
             weight_decay=env_float("WEIGHT_DECAY", 0.01),
             grad_clip_norm=env_float("GRAD_CLIP_NORM", 1.0),
-            warmup_steps=env_int("WARMUP_STEPS", 500),
+            warmup_steps=env_int("WARMUP_STEPS", 1000),
         )
 
 
@@ -91,6 +96,7 @@ class DataConfig:
     batch_size: int
     num_workers: int = 2
     max_windows_per_utt: int | None = None
+    macro_batch_size: int | None = None
 
     @classmethod
     def from_env(cls, *, default_dataset_root: str) -> DataConfig:
@@ -107,7 +113,23 @@ class DataConfig:
             batch_size=env_int("BATCH_SIZE", 24),
             num_workers=env_int("NUM_WORKERS", 2),
             max_windows_per_utt=max_windows_per_utt,
+            macro_batch_size=env_optional_int("MACRO_BATCH_SIZE"),
         )
+
+    def gradient_accumulation_steps(self) -> int:
+        """
+        Optimizer steps per ``MACRO_BATCH_SIZE / BATCH_SIZE`` micro-batches.
+
+        When ``MACRO_BATCH_SIZE`` is unset or equals ``batch_size``, returns 1.
+        """
+        if self.macro_batch_size is None or self.macro_batch_size <= self.batch_size:
+            return 1
+        if self.macro_batch_size % self.batch_size != 0:
+            raise ValueError(
+                f"MACRO_BATCH_SIZE ({self.macro_batch_size}) must be a multiple of "
+                f"BATCH_SIZE ({self.batch_size})"
+            )
+        return self.macro_batch_size // self.batch_size
 
 
 @dataclass(frozen=True)
@@ -173,15 +195,76 @@ class Stage1Config:
     val_max_utterances: int | None = 100  # None = full dev-clean
 
 
+def _parse_llm_max_memory(raw: str | None) -> dict[int, str] | None:
+    """
+    Parse ``LLM_MAX_MEMORY`` (e.g. ``0:15GiB,1:5GiB``) for HuggingFace ``max_memory``.
+
+    Indices are logical CUDA device ids (``0``, ``1``, …) after ``CUDA_VISIBLE_DEVICES``.
+    """
+    if not raw or not raw.strip():
+        return None
+    result: dict[int, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        idx_str, _, size = part.partition(":")
+        idx_str = idx_str.strip()
+        size = size.strip()
+        if not idx_str or not size:
+            raise ValueError(f"Invalid LLM_MAX_MEMORY entry: {part!r}")
+        result[int(idx_str)] = size
+    return result if result else None
+
+
 @dataclass(frozen=True)
 class DeviceConfig:
-    """Primary compute device. Set ``DEVICE=cpu`` to force CPU; default is CUDA when available."""
+    """
+    Primary compute device for Whisper/adapter (``DEVICE``).
+
+    Optional ``LLM_DEVICE`` places the frozen Qwen on a different device
+    (e.g. ``DEVICE=cpu`` + ``LLM_DEVICE=cuda:1``).
+    """
 
     device: str = "cuda"
+    llm_device: str | None = None
+    llm_max_memory: dict[int, str] | None = None
 
     @classmethod
     def from_env(cls) -> DeviceConfig:
-        return cls(device=env_str("DEVICE", "cuda") or "cuda")
+        return cls(
+            device=env_str("DEVICE", "cuda") or "cuda",
+            llm_device=env_str("LLM_DEVICE"),
+            llm_max_memory=_parse_llm_max_memory(env_str("LLM_MAX_MEMORY")),
+        )
+
+
+@dataclass(frozen=True)
+class AsrExperimentConfig:
+    """Ablation / experiment overrides for Stage 2 ASR training."""
+
+    load_stage1_checkpoint: bool = True
+    train_gate: bool = True
+    checkpoint_basename: str = "adapter_stage2"
+    gate_checkpoint: str | None = None
+    adapter_checkpoint: str | None = None
+
+    @classmethod
+    def from_env(cls, *, pkg_root: str | None = None) -> AsrExperimentConfig:
+        basename = env_str("CHECKPOINT_BASENAME", "adapter_stage2") or "adapter_stage2"
+        gate_ckpt = env_str("GATE_CHECKPOINT")
+        if gate_ckpt and pkg_root and not os.path.isabs(gate_ckpt):
+            gate_ckpt = os.path.join(pkg_root, gate_ckpt)
+        adapter_ckpt = env_str("ADAPTER_CHECKPOINT")
+        if adapter_ckpt and pkg_root and not os.path.isabs(adapter_ckpt):
+            adapter_ckpt = os.path.join(pkg_root, adapter_ckpt)
+        return cls(
+            load_stage1_checkpoint=env_bool("LOAD_STAGE1_CHECKPOINT", True),
+            train_gate=env_bool("TRAIN_GATE", True),
+            checkpoint_basename=basename,
+            gate_checkpoint=gate_ckpt,
+            adapter_checkpoint=adapter_ckpt,
+        )
 
 
 @dataclass(frozen=True)
@@ -202,12 +285,16 @@ class Stage2Config:
     enable_llm_gradient_checkpointing: bool = False
     val_enabled: bool = True
     val_every_steps: int = 1000
-    val_max_utterances: int | None = 100  # None = full dev-clean
+    val_max_utterances: int | None = None  # None = full dev-clean
+    val_max_new_tokens: int = 496
+    val_num_beams: int = 1
+    val_repetition_penalty: float = 1.25
+    val_log_every: int = 50
 
     @classmethod
     def from_env(cls) -> Stage2Config:
         val_max_raw = env_str("VAL_MAX_UTTERANCES")
-        val_max_utterances: int | None = 100
+        val_max_utterances: int | None = None
         if val_max_raw:
             normalized = val_max_raw.strip().lower()
             if normalized in {"all", "none", "unlimited"}:
@@ -231,6 +318,10 @@ class Stage2Config:
             val_enabled=env_bool("VAL_ENABLED", True),
             val_every_steps=env_int("VAL_EVERY_STEPS", 1000),
             val_max_utterances=val_max_utterances,
+            val_max_new_tokens=env_int("VAL_MAX_NEW_TOKENS", 496),
+            val_num_beams=env_int("VAL_NUM_BEAMS", 1),
+            val_repetition_penalty=env_float("VAL_REPETITION_PENALTY", 1.25),
+            val_log_every=env_int("VAL_LOG_EVERY", 50),
         )
 
 
@@ -321,7 +412,7 @@ class StreamingAdapterTrainConfig:
 
     d_encoder: int = 768
     d_llm: int = 4096
-    num_queries: int = 4
+    num_queries: int = 2
     num_layers: int = 8
     num_heads: int = 12
     d_ffn: int = 2048
