@@ -42,6 +42,67 @@ def contrastive_infonce_loss(
 
     return loss
 
+
+def clap_loss(
+    *,
+    audio_tokens: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    temperature: float,
+    return_diagnostics: bool = False,
+) -> torch.Tensor:
+    """
+    Symmetric CLAP contrastive loss over an audio-text similarity matrix.
+
+    For batch size N with joint embeddings Ea, Et in R^{N x d}:
+      C = tau * (Et @ Ea^T)
+      L = 0.5 * (l_text(C) + l_audio(C))
+    where l_k averages log diag(softmax(C)) along the text and audio axes.
+
+    audio_tokens: (B, T_a, D) or (B, D)
+    text_embeddings: (B, T_t, D) or (B, D)
+    temperature: tau scaling factor for logits
+    """
+    if audio_tokens.ndim == 3:
+        ea = audio_tokens.float().mean(dim=1)
+    else:
+        ea = audio_tokens.float()
+    if text_embeddings.ndim == 3:
+        et = text_embeddings.float().mean(dim=1)
+    else:
+        et = text_embeddings.float()
+
+    ea = ea - ea.mean(dim=0, keepdim=True)
+    et = et - et.mean(dim=0, keepdim=True)
+
+    ea = F.normalize(ea, dim=-1)
+    et = F.normalize(et, dim=-1)
+
+    n = ea.shape[0]
+    c = float(temperature) * (et @ ea.T)
+    labels = torch.arange(n, device=c.device)
+    loss = 0.5 * (F.cross_entropy(c, labels) + F.cross_entropy(c.T, labels))
+    # print(f"CE loss: {loss.item()}")
+
+    if return_diagnostics:
+        with torch.no_grad():
+            sim_matrix = ea @ et.T
+            pos_sim = sim_matrix.diagonal().mean().item()
+            neg_sim = (sim_matrix.sum() - sim_matrix.diagonal().sum()) / (n * n - n)
+            neg_sim = neg_sim.item()
+            pos_minus_neg = pos_sim - neg_sim
+            audio_std = ea.std(dim=0).mean().item()
+            text_std = et.std(dim=0).mean().item()
+        return loss, {
+            "pos_sim": pos_sim,
+            "neg_sim": neg_sim,
+            "pos_minus_neg": pos_minus_neg,
+            "audio_std": audio_std,
+            "text_std": text_std,
+        }
+
+    return loss
+
+
 def kl_distill_loss(
     *,
     student_logits: torch.Tensor,

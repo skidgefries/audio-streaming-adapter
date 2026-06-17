@@ -104,18 +104,41 @@ def resolve_num_samples(dataset_root: str, num_samples: int | str) -> int:
     return int(num_samples)
 
 
-def qwen_device_map_and_max_memory(*, num_cuda_devices: int | None = None) -> tuple[str | None, dict[int, str] | None]:
+# Default Qwen shard caps for eval (override via ``LLM_MAX_MEMORY`` in ``.env``).
+# Whisper/adapter stay on ``cuda:0``; Qwen fills GPU 0, spills to GPU 1, then CPU.
+EVAL_DEFAULT_LLM_MAX_MEMORY: dict[int | str, str] = {
+    0: "5GiB",
+    1: "1.5GiB",
+    "cpu": "64GiB",
+}
+
+
+def _resolve_eval_llm_max_memory(num_cuda_devices: int) -> dict[int | str, str] | None:
+    env_mem = DeviceConfig.from_env().llm_max_memory
+    if env_mem:
+        out: dict[int | str, str] = dict(env_mem)
+        out.setdefault("cpu", "64GiB")
+        return out
+    if num_cuda_devices >= 2:
+        return dict(EVAL_DEFAULT_LLM_MAX_MEMORY)
+    if num_cuda_devices == 1:
+        return {0: "5GiB", "cpu": "64GiB"}
+    return None
+
+
+def qwen_device_map_and_max_memory(
+    *, num_cuda_devices: int | None = None
+) -> tuple[str | None, dict[int | str, str] | None]:
     n = num_cuda_devices if num_cuda_devices is not None else visible_gpu_count()
-    max_memory = DeviceConfig.from_env().llm_max_memory
-    gpu_entries = [k for k in (max_memory or {}) if isinstance(k, int)]
-    # Whisper/adapter on GPU 0; Qwen sequential spill to GPU 1 when LLM_MAX_MEMORY lists both.
-    if n >= 2 and max_memory and len(gpu_entries) >= 2:
-        return "sequential", max_memory
     if device_env_has_explicit_index():
         return None, None
-    if n >= 2:
-        return "auto", None
-    return None, None
+    max_memory = _resolve_eval_llm_max_memory(n)
+    if max_memory is None:
+        return None, None
+    gpu_entries = [k for k in max_memory if isinstance(k, int)]
+    if len(gpu_entries) >= 2:
+        return "sequential", max_memory
+    return "sequential", max_memory
 
 
 def release_cuda_memory() -> None:
@@ -314,7 +337,7 @@ def _compute_cosine_embeddings(
         if i % 50 == 0:
             print(f"  Processing {i}/{len(pairs)}...")
 
-        wave = _load_mono_waveform_16k(audio_path)
+        wave = load_mono_waveform_16k(audio_path)
         windows = audio_extractor.waveform_to_windows(wave)
         if len(windows) == 0:
             continue
@@ -524,7 +547,7 @@ def _compute_audio_prefix_tokens(audio_extractor, adapter, pairs, *, device: tor
         if i % 50 == 0:
             print(f"  Processing audio {i}/{len(pairs)}...")
 
-        wave = _load_mono_waveform_16k(audio_path)
+        wave = load_mono_waveform_16k(audio_path)
         windows = audio_extractor.waveform_to_windows(wave)
         if len(windows) == 0:
             continue
@@ -779,11 +802,14 @@ def run_retrieval_nll(*, stage: int, args: argparse.Namespace) -> None:
         nll_scores = saved["matrix"]
     else:
         device, torch_dtype, num_cuda = init_eval_device()
+        llm_map, llm_max_memory = qwen_device_map_and_max_memory(num_cuda_devices=num_cuda)
 
         print(
-            f"Device: {device} (visible CUDA devices: {num_cuda}, "
-            f"single-GPU eval — Whisper then Qwen on {device})\n"
+            f"Device: {device} (visible CUDA devices: {num_cuda}; "
+            f"Whisper/adapter on {device}, Qwen device_map={llm_map!r})"
         )
+        if llm_max_memory:
+            print(f"Qwen max_memory: {llm_max_memory!r}")
 
         print(f"Loading test-clean from {args.dataset_root}...")
         dataset = LibriSpeechPairs(args.dataset_root)
@@ -1115,7 +1141,7 @@ def _build_asr_pipeline(
     model_ids: FrozenModelIdsConfig,
     stage2: Stage2Config,
     llm_device_map: str | None,
-    llm_max_memory: dict[int, str] | None = None,
+    llm_max_memory: dict[int | str, str] | None = None,
 ):
     whisper = load_whisper_models(
         cfg=WhisperConfig(
@@ -1337,7 +1363,7 @@ def _evaluate_asr_one_variant(
     prompt_asr: bool,
     append_im_end: bool,
     run_name: str,
-    llm_max_memory: dict[int, str] | None = None,
+    llm_max_memory: dict[int | str, str] | None = None,
 ) -> dict[str, Any]:
     print(f"\n{'=' * 60}\nASR eval — {run_name}\n  checkpoint: {checkpoint_path}\n{'=' * 60}")
 

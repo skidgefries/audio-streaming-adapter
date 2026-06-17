@@ -36,22 +36,17 @@ if _hf_token:
 from src.adapter.streaming_adapter import StreamingAdapter
 from src.dataset import LibriSpeechConfig, load_mono_waveform_16k, LibriSpeechPairsCustom, LibriSpeechPairs
 from src.encoder.waveform_window_encoder import WhisperWindowFeatureExtractor
-from training.utils.checkpointing import (
-    TrainingCheckpoint,
-    maybe_upload_stage_epoch_checkpoint,
-    save_checkpoint,
-)
+from training.utils.checkpointing import TrainingCheckpoint, save_checkpoint
 from training.utils.config import (
     CheckpointConfig,
     DataConfig,
-    HfCheckpointConfig,
     OptimConfig,
     Stage1Config,
     DeviceConfig,
     WandbConfig,
 )
 from training.utils.logging import WandbLogger
-from training.utils.losses import contrastive_infonce_loss
+from training.utils.losses import clap_loss
 from training.utils.metrics import RunningMean
 from training.utils.loaders import load_frozen_qwen_embeddings
 from training.utils.stage1_validation import validate_stage1_contrastive, wandb_val_log_dict
@@ -87,11 +82,11 @@ DATASET_ROOTS = LibriSpeechConfig.resolve_train_roots(
 )
 VAL_ROOT = LibriSpeechConfig.dev_clean_root(_TRAINING_DIR)
 DATA = DataConfig.from_env(default_dataset_root=DATASET_ROOTS[0])
-CKPT = CheckpointConfig(dir="checkpoints", save_every_epochs=1)
-HF_CKPT = HfCheckpointConfig.from_env()
-WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="stage1-bigger-dataset")
+CKPT = CheckpointConfig(dir="checkpoints", save_every_steps=500)
+WANDB = WandbConfig(enabled=True, project="audio-streaming-adapter", run_name="stage1-CLAP-loss")
 
-SAVE_PATH = os.path.join(CKPT.dir, "adapter_stage1.pt")
+CHECKPOINT_BASENAME = "adapter_stage1"
+SAVE_PATH = os.path.join(CKPT.dir, f"{CHECKPOINT_BASENAME}.pt")
 
 
 
@@ -105,6 +100,54 @@ def _pad_tokens(utterances: list[torch.Tensor]) -> torch.Tensor:
             t = torch.cat([t, pad], dim=1)
         padded.append(t)
     return torch.cat(padded, dim=0)
+
+
+def _make_stage1_checkpoint(
+    *,
+    epoch: int,
+    global_step: int,
+    adapter: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    metrics: dict[str, float],
+) -> TrainingCheckpoint:
+    return TrainingCheckpoint(
+        stage=1,
+        epoch=epoch,
+        global_step=global_step,
+        adapter_state_dict=adapter.state_dict(),
+        optimizer_state_dict=optimizer.state_dict(),
+        scheduler_state_dict=scheduler.state_dict(),
+        metrics=metrics,
+    )
+
+
+def _maybe_save_step_checkpoint(
+    *,
+    epoch: int,
+    global_step: int,
+    adapter: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    metrics: dict[str, float],
+) -> None:
+    interval = CKPT.save_every_steps
+    if interval is None or interval <= 0:
+        return
+    if global_step <= 0 or global_step % interval != 0:
+        return
+    ckpt = _make_stage1_checkpoint(
+        epoch=epoch + 1,
+        global_step=global_step,
+        adapter=adapter,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        metrics=metrics,
+    )
+    save_checkpoint(SAVE_PATH, ckpt)
+    step_path = os.path.join(CKPT.dir, f"{CHECKPOINT_BASENAME}_step{global_step}.pt")
+    save_checkpoint(step_path, ckpt)
+    print(f"  Checkpoint (step {global_step}) -> {SAVE_PATH}\n              step file -> {step_path}")
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -143,7 +186,7 @@ def train():
     print(f"StreamingAdapter initialized:")
     print(f"  Encoder dim: {WHISPER_DIM}")
     print(f"  LLM dim: {LLM_DIM}")
-    print(f"  Max tokens/window: 4\n")
+    print(f"  Max tokens/window: {adapter.num_queries}\n")
     
     # Dataset and dataloader (train-clean-100 + train-clean-360)
     dataset = LibriSpeechPairs(DATASET_ROOTS)
@@ -246,9 +289,17 @@ def train():
         if os.path.isdir(VAL_ROOT):
             cap = STAGE.val_max_utterances
             cap_str = "all" if cap is None else str(cap)
-            print(f"  Validation: dev-clean ({VAL_ROOT}), max {cap_str} utterances/epoch")
+            print(
+                f"  Validation: dev-clean ({VAL_ROOT}), every {STAGE.val_every_steps} steps, "
+                f"max {cap_str} utterances/run"
+            )
         else:
             print(f"  Validation: dev-clean not found at {VAL_ROOT} (will skip until present)")
+    if CKPT.save_every_steps:
+        print(
+            f"  Checkpoints: every {CKPT.save_every_steps} steps -> "
+            f"{SAVE_PATH} + {CHECKPOINT_BASENAME}_step<N>.pt"
+        )
     print(f"  Epochs: {STAGE.epochs}")
     print(f"  Batch size: {DATA.batch_size}")
     print(f"  Learning rate: {OPT.lr}")
@@ -314,12 +365,13 @@ def train():
 
             # Compute losses
             # Contrastive loss (already internally converts to float32)
-                align_loss, diag = contrastive_infonce_loss(
+                align_loss, diag = clap_loss(
                     audio_tokens=audio_tokens,
                     text_embeddings=label_embeds,
                     temperature=STAGE.temperature,
                     return_diagnostics = True
                 )
+                
                 stability_loss = stab_sum / float(len(audio_paths))
 
             if torch.isnan(stability_loss):
@@ -384,7 +436,7 @@ def train():
             global_step += 1
 
             # Logging
-            if step % 10 == 0:
+            if step % DATA.batch_size == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 print(f"Step {step:4d}/{len(dataloader)} | "
                       f"Loss: {total_loss.item():.4f} | "
@@ -408,81 +460,74 @@ def train():
                     step=global_step,
                 )
 
+            step_metrics: dict[str, float] = {
+                "loss": m_total.mean,
+                "align": m_align.mean,
+                "stability": m_stab.mean,
+            }
+
+            if (
+                STAGE.val_enabled
+                and global_step > 0
+                and global_step % STAGE.val_every_steps == 0
+            ):
+                if os.path.isdir(VAL_ROOT):
+                    print(f"\n  [val step {global_step}]")
+                    val_metrics = validate_stage1_contrastive(
+                        adapter=adapter,
+                        audio_extractor=audio,
+                        llm_tokenizer=llm_tokenizer,
+                        text_embedder=text_embedder,
+                        val_root=VAL_ROOT,
+                        device=DEVICE,
+                        batch_size=DATA.batch_size,
+                        num_workers=DATA.num_workers,
+                        temperature=STAGE.temperature,
+                        lambda_stability=STAGE.lambda_stability,
+                        max_utterances=STAGE.val_max_utterances,
+                        pad_tokens_fn=_pad_tokens,
+                        maybe_autocast_fn=_maybe_autocast,
+                        epoch=epoch,
+                    )
+                    logger.log(wandb_val_log_dict(val_metrics), step=global_step)
+                else:
+                    print(f"  [WARN] Skipping validation — dev-clean not found at {VAL_ROOT}")
+
+            _maybe_save_step_checkpoint(
+                epoch=epoch,
+                global_step=global_step,
+                adapter=adapter,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                metrics=step_metrics,
+            )
+
             # Cleanup
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        # Validation on dev-clean
         print(f"\nEpoch {epoch + 1} complete:")
         print(f"  Train Loss: {m_total.mean:.4f}")
         print(f"  Train Align: {m_align.mean:.4f}")
-        print(f"  Train Stability: {m_stab.mean:.4f}")
+        print(f"  Train Stability: {m_stab.mean:.4f}\n")
 
-        epoch_metrics: dict[str, float] = {
-            "loss": m_total.mean,
-            "align": m_align.mean,
-            "stability": m_stab.mean,
-        }
-        if STAGE.val_enabled and os.path.isdir(VAL_ROOT):
-            val_metrics = validate_stage1_contrastive(
-                adapter=adapter,
-                audio_extractor=audio,
-                llm_tokenizer=llm_tokenizer,
-                text_embedder=text_embedder,
-                val_root=VAL_ROOT,
-                device=DEVICE,
-                batch_size=DATA.batch_size,
-                num_workers=DATA.num_workers,
-                temperature=STAGE.temperature,
-                lambda_stability=STAGE.lambda_stability,
-                max_utterances=STAGE.val_max_utterances,
-                pad_tokens_fn=_pad_tokens,
-                maybe_autocast_fn=_maybe_autocast,
-                epoch=epoch,
-            )
-            logger.log(wandb_val_log_dict(val_metrics), step=global_step)
-            epoch_metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
-        elif STAGE.val_enabled:
-            print(f"  [WARN] Skipping validation — dev-clean not found at {VAL_ROOT}")
-        print()
-
-        EPOCH_SAVE_PATH = os.path.join(CKPT.dir, f"adapter_stage1_epoch{epoch+1}.pt")
-            
-        save_checkpoint(
-            SAVE_PATH,
-            TrainingCheckpoint(
-                stage=1,
-                epoch=epoch + 1,
-                global_step=global_step,
-                adapter_state_dict=adapter.state_dict(),
-                optimizer_state_dict=optimizer.state_dict(),
-                scheduler_state_dict=scheduler.state_dict(),
-                metrics=epoch_metrics,
-            ),
-        )
-        
-        save_checkpoint(
-            EPOCH_SAVE_PATH,
-            TrainingCheckpoint(
-                stage=1,
-                epoch=epoch + 1,
-                global_step=global_step,
-                adapter_state_dict=adapter.state_dict(),
-                optimizer_state_dict=optimizer.state_dict(),
-                scheduler_state_dict=scheduler.state_dict(),
-                metrics=epoch_metrics,
-            ),
-        )
-        maybe_upload_stage_epoch_checkpoint(
-            EPOCH_SAVE_PATH,
-            stage=1,
-            repo_id=HF_CKPT.repo_id,
-            revision=HF_CKPT.revision,
-            private=HF_CKPT.private,
-            token=_hf_token,
-            enabled=HF_CKPT.upload_enabled,
-        )
-        print(f"Checkpoint saved to {SAVE_PATH}\n")
+    final_metrics: dict[str, float] = {
+        "loss": m_total.mean,
+        "align": m_align.mean,
+        "stability": m_stab.mean,
+    }
+    save_checkpoint(
+        SAVE_PATH,
+        _make_stage1_checkpoint(
+            epoch=STAGE.epochs,
+            global_step=global_step,
+            adapter=adapter,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            metrics=final_metrics,
+        ),
+    )
+    print(f"Final checkpoint saved to {SAVE_PATH}")
 
     print("Stage 1 training complete!")
     logger.finish()

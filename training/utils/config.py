@@ -190,10 +190,10 @@ class Stage1Config:
     epochs: int = 10
     lambda_stability: float = 0.1
     # lambda_stability = 0.0
-    temperature: float = 0.2
+    temperature: float = 14.3
     val_enabled: bool = True
-    val_max_utterances: int | None = 100  # None = full dev-clean
-
+    val_every_steps: int = 1000
+    val_max_utterances: int | None = None  # None = full dev-clean
 
 def _parse_llm_max_memory(raw: str | None) -> dict[int, str] | None:
     """
