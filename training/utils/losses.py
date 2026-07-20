@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import math
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+
 
 
 def contrastive_infonce_loss(
     *,
     audio_tokens: torch.Tensor,
     text_embeddings: torch.Tensor,
-    temperature: float,
+    temperature: float = 0.07,
     return_diagnostics: bool = False
 ) -> torch.Tensor:
     """
@@ -18,6 +22,7 @@ def contrastive_infonce_loss(
     text_embeddings: (B, T_t, D)
     """
     b = audio_tokens.shape[0]
+    temperature = nn.Parameter(torch.tensor(temperature))
     a_pooled = audio_tokens.float().mean(dim=1)
     t_pooled = text_embeddings.float().mean(dim=1) 
     a_pooled = a_pooled - a_pooled.mean(dim=0, keepdim=True)
@@ -26,8 +31,9 @@ def contrastive_infonce_loss(
     t = F.normalize(t_pooled, dim=-1)   
     # a = F.normalize(audio_tokens.float().mean(dim=1), dim=-1)
     # t = F.normalize(text_embeddings.float().mean(dim=1), dim=-1)
-    logits = (a @ t.T) / float(temperature)
-    loss =  F.cross_entropy(logits, torch.arange(b, device=logits.device))
+    logits =  float(temperature) * (a @ t.T)
+    # loss =  F.cross_entropy(logits, torch.arange(b, device=logits.device))
+    loss = F.cross_entropy_with_logits(logits, torch.arange(b, device=logits.device))
     
     if return_diagnostics:
         with torch.no_grad():
@@ -41,6 +47,140 @@ def contrastive_infonce_loss(
         return loss, {"pos_sim": pos_sim, "neg_sim": neg_sim, "pos_minus_neg": pos_minus_neg, "audio_std": audio_std, "text_std": text_std}
 
     return loss
+
+
+def init_contrastive_logit_scale(
+    initial_temperature: float,
+    *,
+    device: torch.device | str,
+) -> nn.Parameter:
+    """
+    Learnable log-scale for InfoNCE logits.
+
+  Effective temperature applied to cosine similarities is ``exp(logit_scale)``,
+    initialized to match ``contrastive_infonce_loss(..., temperature=initial_temperature)``.
+    """
+    return nn.Parameter(
+        torch.tensor(math.log(float(1.0/initial_temperature)), device=device, dtype=torch.float32)
+    )
+
+
+def contrastive_infonce_loss_learnable_temperature(
+    *,
+    audio_tokens: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    logit_scale: nn.Parameter | torch.Tensor,
+    return_diagnostics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
+    """
+    InfoNCE loss on pooled representations with learnable logit scale.
+
+    audio_tokens: (B, T_a, D)
+    text_embeddings: (B, T_t, D)
+    logit_scale: learnable scalar; logits use ``logit_scale.exp() * (a @ t.T)``
+    """
+    b = audio_tokens.shape[0]
+    a_pooled_mean = audio_tokens.float().mean(dim=1)
+    t_pooled_mean = text_embeddings.float().mean(dim=1)
+    # a_pooled_std = a_pooled_mean - a_pooled_mean.mean(dim=0, keepdim=True)
+    # t_pooled_std = t_pooled_mean - t_pooled_mean.mean(dim=0, keepdim=True)
+    a_pooled = a_pooled_mean - a_pooled_mean.mean(dim=0, keepdim=True)
+    t_pooled = t_pooled_mean - t_pooled_mean.mean(dim=0, keepdim=True)
+    # a_pooled = torch.cat([a_pooled_mean, a_pooled_std], dim=-1)
+    # t_pooled = torch.cat([t_pooled_mean, t_pooled_std], dim=-1)
+    a = F.normalize(a_pooled, dim=-1)
+    t = F.normalize(t_pooled, dim=-1)
+    scale = logit_scale.exp().clamp(max=100)
+    logits = scale * (a @ t.T)
+    # loss = F.cross_entropy(logits, torch.arange(b, device=logits.device))
+    loss = F.cross_entropy(logits, torch.arange(b, device=logits.device))
+
+    if return_diagnostics:
+        with torch.no_grad():
+            sim_matrix = a @ t.T  # (B, B) — cosine similarities
+            pos_sim = sim_matrix.diagonal().mean().item()
+            neg_sim = (sim_matrix.sum() - sim_matrix.diagonal().sum()) / (b * b - b)
+            neg_sim = neg_sim.item()
+            pos_minus_neg = pos_sim - neg_sim
+            audio_std = a.std(dim=0).mean().item()
+            text_std = t.std(dim=0).mean().item()
+        return loss, {
+            "pos_sim": pos_sim,
+            "neg_sim": neg_sim,
+            "pos_minus_neg": pos_minus_neg,
+            "audio_std": audio_std,
+            "text_std": text_std,
+            "logit_scale": logit_scale.exp().item(),
+        }
+
+    return loss
+
+
+def clap_loss_learnable_temperature(
+    *,
+    audio_tokens: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    logit_scale: nn.Parameter | torch.Tensor,
+    return_diagnostics: bool = False,
+) -> torch.Tensor:
+    """
+    Symmetric CLAP contrastive loss over an audio-text similarity matrix.
+
+    For batch size N with joint embeddings Ea, Et in R^{N x d}:
+      C = tau * (Et @ Ea^T)
+      L = 0.5 * (l_text(C) + l_audio(C))
+    where l_k averages log diag(softmax(C)) along the text and audio axes.
+
+    audio_tokens: (B, T_a, D) or (B, D)
+    text_embeddings: (B, T_t, D) or (B, D)
+    initial_temperature: tau scaling factor for logits
+    """
+    if audio_tokens.ndim == 3:
+        a_pooled = audio_tokens.float().mean(dim=1)
+    else:
+        a_pooled = audio_tokens.float()
+    if text_embeddings.ndim == 3:
+        t_pooled = text_embeddings.float().mean(dim=1)
+    else:
+        t_pooled = text_embeddings.float()
+
+    a_pooled = a_pooled - a_pooled.mean(dim=0, keepdim=True)
+    t_pooled = t_pooled - t_pooled.mean(dim=0, keepdim=True)
+
+    a_pooled = F.normalize(a_pooled, dim=-1)
+    t_pooled = F.normalize(t_pooled, dim=-1)
+
+    loss_device = logit_scale.device
+    a_pooled = a_pooled.to(loss_device)
+    t_pooled = t_pooled.to(loss_device)
+
+    n = a_pooled.shape[0]
+    scale = logit_scale.exp().clamp(max=100)
+    c = scale * (t_pooled @ a_pooled.T)
+    labels = torch.arange(n, device=c.device)
+    loss = 0.5 * (F.cross_entropy(c, labels) + F.cross_entropy(c.T, labels))
+    # print(f"CE loss: {loss.item()}")
+
+    if return_diagnostics:
+        with torch.no_grad():
+            sim_matrix = t_pooled @ a_pooled.T
+            pos_sim = sim_matrix.diagonal().mean().item()
+            neg_sim = (sim_matrix.sum() - sim_matrix.diagonal().sum()) / (n * n - n)
+            neg_sim = neg_sim.item()
+            pos_minus_neg = pos_sim - neg_sim
+            audio_std = a_pooled.std(dim=0).mean().item()
+            text_std = t_pooled.std(dim=0).mean().item()
+        return loss, {
+            "pos_sim": pos_sim,
+            "neg_sim": neg_sim,
+            "pos_minus_neg": pos_minus_neg,
+            "audio_std": audio_std,
+            "text_std": text_std,
+            "logit_scale": logit_scale.exp().item(),
+        }
+
+    return loss
+
 
 
 def clap_loss(
@@ -99,6 +239,86 @@ def clap_loss(
             "audio_std": audio_std,
             "text_std": text_std,
         }
+
+    return loss
+
+
+def init_sigmoid_logit_bias(
+    *,
+    device: torch.device | str,
+    initial_bias: float = -10.0,
+) -> nn.Parameter:
+    """
+    Learnable bias for SigLIP-style sigmoid contrastive loss.
+
+    Initialized to ``initial_bias`` (default -10) so early training is not
+    dominated by the many negative pairs in each batch.
+    """
+    return nn.Parameter(
+        torch.tensor(float(initial_bias), device=device, dtype=torch.float32)
+    )
+
+
+def sigmoid_loss_learnable_temperature(
+    *,
+    audio_tokens: torch.Tensor,
+    text_embeddings: torch.Tensor,
+    logit_scale: nn.Parameter | torch.Tensor,
+    logit_bias: nn.Parameter | torch.Tensor | None = None,
+    return_diagnostics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
+    """
+    SigLIP-style sigmoid loss over pooled audio-text similarities.
+
+    Each pair (i, j) is a binary match/non-match: +1 on the diagonal,
+    -1 off-diagonal. For batch size B and cosine similarity matrix S:
+
+      logits = exp(logit_scale) * S (+ logit_bias if provided)
+      loss = mean_i sum_j -log sigmoid(z_ij * logits_ij)
+
+    audio_tokens: (B, T_a, D)
+    text_embeddings: (B, T_t, D)
+    logit_scale: learnable scalar; logits use ``logit_scale.exp() * (a @ t.T)``
+    logit_bias: optional learnable scalar bias added to all logits
+    """
+    b = audio_tokens.shape[0]
+    a_pooled_mean = audio_tokens.float().mean(dim=1)
+    t_pooled_mean = text_embeddings.float().mean(dim=1)
+    a_pooled = a_pooled_mean - a_pooled_mean.mean(dim=0, keepdim=True)
+    t_pooled = t_pooled_mean - t_pooled_mean.mean(dim=0, keepdim=True)
+    a = F.normalize(a_pooled, dim=-1)
+    t = F.normalize(t_pooled, dim=-1)
+
+    scale = logit_scale.exp().clamp(max=100)
+    logits = scale * (a @ t.T)
+    if logit_bias is not None:
+        logits = logits + logit_bias
+
+    eye = torch.eye(b, device=logits.device, dtype=logits.dtype)
+    labels = -torch.ones_like(logits) + 2 * eye
+    nll = -F.logsigmoid(labels * logits).sum(dim=-1)
+    loss = nll.mean()
+
+    if return_diagnostics:
+        with torch.no_grad():
+            sim_matrix = a @ t.T
+            pos_sim = sim_matrix.diagonal().mean().item()
+            neg_sim = (sim_matrix.sum() - sim_matrix.diagonal().sum()) / (b * b - b)
+            neg_sim = neg_sim.item()
+            pos_minus_neg = pos_sim - neg_sim
+            audio_std = a.std(dim=0).mean().item()
+            text_std = t.std(dim=0).mean().item()
+            diag: dict[str, float] = {
+                "pos_sim": pos_sim,
+                "neg_sim": neg_sim,
+                "pos_minus_neg": pos_minus_neg,
+                "audio_std": audio_std,
+                "text_std": text_std,
+                "logit_scale": logit_scale.exp().item(),
+            }
+            if logit_bias is not None:
+                diag["logit_bias"] = float(logit_bias.item())
+            return loss, diag
 
     return loss
 

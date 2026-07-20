@@ -22,6 +22,8 @@ class TrainingCheckpoint:
     scheduler_state_dict: dict | None = None
     metrics: dict | None = None
     hyperparams: dict | None = None
+    contrastive_logit_scale: float | None = None
+    contrastive_logit_bias: float | None = None
 
 
 def save_checkpoint(path: str, ckpt: TrainingCheckpoint) -> None:
@@ -40,6 +42,10 @@ def save_checkpoint(path: str, ckpt: TrainingCheckpoint) -> None:
         payload["optimizer_state_dict"] = ckpt.optimizer_state_dict
     if ckpt.scheduler_state_dict is not None:
         payload["scheduler_state_dict"] = ckpt.scheduler_state_dict
+    if ckpt.contrastive_logit_scale is not None:
+        payload["contrastive_logit_scale"] = ckpt.contrastive_logit_scale
+    if ckpt.contrastive_logit_bias is not None:
+        payload["contrastive_logit_bias"] = ckpt.contrastive_logit_bias
 
     torch.save(payload, path)
 

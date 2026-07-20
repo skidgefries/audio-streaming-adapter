@@ -42,6 +42,14 @@ class LibriSpeechConfig:
         ]
 
     @staticmethod
+    def train_clean_100_roots(training_dir: str) -> list[str]:
+        """LibriSpeech train-clean-100 split directories."""
+        base = LibriSpeechConfig._librispeech_base(training_dir)
+        return [
+            os.path.join(base, "train-clean-100"),
+        ]
+
+    @staticmethod
     def resolve_train_roots(
         training_dir: str,
         *,
@@ -55,7 +63,8 @@ class LibriSpeechConfig:
         if env_override and env_override.strip():
             parts = [p.strip() for p in env_override.split(",") if p.strip()]
             return [os.path.normpath(p) for p in parts]
-        return LibriSpeechConfig.train_clean_100_and_360_roots(training_dir)
+        # return LibriSpeechConfig.train_clean_100_and_360_roots(training_dir)
+        return LibriSpeechConfig.train_clean_100_roots(training_dir)
 
     @staticmethod
     def dev_clean_root(training_dir: str) -> str:

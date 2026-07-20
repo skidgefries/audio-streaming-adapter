@@ -1,40 +1,30 @@
 """
-ASR-only training: window → encoder → adapter → frozen LLM.
+Stage 2 (simplified): ASR + align + stability — train StreamingAdapter only.
 
-Trains the StreamingAdapter with causal LM loss on teacher-forced transcripts.
-By default initializes adapter weights from a Stage 1 checkpoint
-(``STAGE1_CHECKPOINT``, default ``checkpoints/stage1_final_checkpoint.pt``).
-No gate, no rate controller. Align/stability/rate/sparse/gate losses are computed
-and logged for monitoring but only ASR loss drives backpropagation. Validation on
-dev-clean reports the same auxiliary losses (batched), plus WER and BLEU-4.
+Frozen Whisper encoder and frozen Qwen LLM. No rate controller, no turn-end gate,
+no early-commit gate. Adapter uses the EMA stability buffer (``ema_alpha``).
 
-Pipeline per utterance:
-  1. AudioWaveformWindowizer (0.8s / 0.4s stride)
-  2. Whisper encode per window (WhisperWindowFeatureExtractor)
-  3. StreamingAdapter.forward_window(encoder_features)
-  4. Frozen Qwen CE loss on [audio_tokens | BOS | transcript]
+Loss (all backprop through adapter)::
 
-**Single process (2 GPUs recommended)**::
+    total = ASR + λ_align · InfoNCE(align) + λ_stability · stability_buffer_loss
 
-    uv run training/adapter_asr_only_trainer.py
+InfoNCE uses ``TEMPERATURE`` from ``.env`` (default 0.07). Stage 1 warm-start defaults
+to ``checkpoints/stage1_final_checkpoint.pt``.
 
-Whisper + adapter run on ``cuda:0``. Frozen Qwen is loaded with
-``device_map='sequential'`` and ``LLM_MAX_MEMORY=0:10GiB,1:2GiB,cpu:64GiB`` (10 GiB Qwen on GPU 0,
-2 GiB spill on GPU 1, remainder on CPU; leaves ~5 GiB on GPU 0 for Whisper + adapter). Visible GPUs are reserved exclusively for the run
-(``GPU_LOCK=true``); other training/eval scripts block until this process exits.
-Weights & Biases logging is enabled by default
-(``WANDB_ENABLED=true``); set ``WANDB_API_KEY`` in ``.env``.
+**Run**::
 
-**Multi-GPU data parallel**::
+    uv run training/adapter_asr_align_trainer.py
 
-    uv run torchrun --standalone --nnodes=1 --nproc_per_node=1 training/adapter_asr_only_trainer.py
+GPU layout (overrides ``.env`` when unset): ``DEVICE=cpu`` (Whisper + adapter),
+``LLM_DEVICE=cuda:0`` with ``LLM_MAX_MEMORY=0:14GiB,1:2GiB,cpu:64GiB`` (Qwen on free GPU 0;
+minimal 2 GiB spill to GPU 1 if needed). VRAM caps auto-shrink when a GPU is busy.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 
 _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _src_root = os.path.join(_pkg_root, "src")
@@ -48,16 +38,19 @@ _env_path = load_project_env(_pkg_root)
 if _env_path:
     print(f"Loaded environment from {_env_path}")
 
-# ASR-only defaults: Whisper/adapter on cuda:0; Qwen sequential cuda:0 → cuda:1 → cpu.
-# GPU 0 is ~16 GiB — capping Qwen at 14+ GiB leaves no room for Whisper/adapter activations.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
-os.environ["DEVICE"] = "cuda:0"
-os.environ["LLM_DEVICE"] = "cuda:0"
-os.environ["LLM_MAX_MEMORY"] = "0:12GiB,1:2GiB,cpu:64GiB"
+# Whisper + adapter on CPU; frozen Qwen on GPU (cuda:0 fill, cuda:1 2 GiB spill, then CPU).
+os.environ.setdefault("DEVICE", "cpu")
+os.environ.setdefault("LLM_DEVICE", "cuda:0")
+os.environ.setdefault("LLM_MAX_MEMORY", "0:14GiB,1:2GiB,cpu:64GiB")
+os.environ.setdefault("BATCH_SIZE", "2")
+os.environ.setdefault("ASR_MICRO_BATCH_SIZE", "1")
+os.environ.setdefault("MAX_WINDOWS_PER_UTT", "32")
+os.environ.setdefault("MAX_TEXT_TOKENS", "128")
+os.environ.setdefault("ENABLE_LLM_GRADIENT_CHECKPOINTING", "true")
 os.environ.setdefault("GPU_LOCK", "true")
-os.environ.setdefault("VAL_MAX_UTTERANCES", "all")
 os.environ.setdefault("WANDB_ENABLED", "true")
-os.environ.setdefault("WANDB_RUN_NAME", "adapter_asr_only")
+os.environ.setdefault("WANDB_RUN_NAME", "adapter_asr_align")
 
 _hf_endpoint = apply_hf_hub_endpoint(_pkg_root)
 print(f"HF Hub endpoint: {_hf_endpoint}")
@@ -91,7 +84,6 @@ from training.utils.asr_only_validation import UtteranceEncodeResult, validate_a
 from training.utils.checkpointing import (
     TrainingCheckpoint,
     adapt_optimizer_state_dict_num_queries,
-    checkpoint_grad_accum_steps,
     filter_adapter_state_dict,
     maybe_upload_stage_epoch_checkpoint,
     resolve_resume_epoch_and_offset,
@@ -108,19 +100,19 @@ from training.utils.config import (
     WandbConfig,
 )
 from training.utils.devices import (
+    adjust_llm_max_memory_for_free_vram,
     cleanup_distributed,
     ensure_device_ready,
     init_training_context,
     llm_input_device,
     resolve_llm_load_plan,
 )
-from training.utils.loaders import default_device_and_dtype, load_frozen_qwen_causal_lm
+from training.utils.loaders import load_frozen_qwen_causal_lm
 from training.utils.logging import WandbLogger
 from training.utils.losses import contrastive_infonce_loss
 from training.utils.metrics import RunningMean
 from training.utils.optimization import TrainingPipeline
 
-_, TORCH_DTYPE = default_device_and_dtype()
 _TRAINING_DIR = os.path.dirname(__file__)
 
 _MODEL_IDS = FrozenModelIdsConfig.from_env()
@@ -137,27 +129,30 @@ VAL_ROOT = LibriSpeechConfig.dev_clean_root(_TRAINING_DIR)
 
 STAGE = Stage2Config.from_env()
 DEVICE_CFG = DeviceConfig.from_env()
+TRAIN_DTYPE = (
+    torch.float32
+    if DEVICE_CFG.device.strip().lower() == "cpu"
+    else (torch.bfloat16 if torch.cuda.is_available() else torch.float32)
+)
+LLM_DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+TORCH_DTYPE = TRAIN_DTYPE
 OPT = OptimConfig.from_env()
 DATA = DataConfig.from_env(default_dataset_root=DATASET_ROOTS[0])
 CKPT = CheckpointConfig.from_env(pkg_root=_pkg_root)
 HF_CKPT = HfCheckpointConfig.from_env()
 WANDB = WandbConfig.from_env()
 
-# CHECKPOINT_BASENAME = env_str("CHECKPOINT_BASENAME", "adapter_asr_only") or "adapter_asr_only"
-CHECKPOINT_BASENAME = "adapter_stage2_infoNCE"
+CHECKPOINT_BASENAME = env_str("CHECKPOINT_BASENAME", "adapter_asr_align") or "adapter_asr_align"
 SAVE_PATH = os.path.join(CKPT.dir, f"{CHECKPOINT_BASENAME}.pt")
 SAVE_EVERY_STEPS = CKPT.save_every_steps if CKPT.save_every_steps is not None else 500
 _stage1_rel = (
-    # env_str("STAGE1_CHECKPOINT", "checkpoints/stage1_final_checkpoint.pt")
-    # or "checkpoints/stage1_final_checkpoint.pt"
-    "checkpoints/adapter_infoNCE_stage1_with_centering.pt"
+    env_str("STAGE1_CHECKPOINT", "checkpoints/stage1_final_checkpoint.pt")
+    or "checkpoints/stage1_final_checkpoint.pt"
 )
-
 STAGE1_SAVE_PATH = (
     _stage1_rel if os.path.isabs(_stage1_rel) else os.path.join(_pkg_root, _stage1_rel)
 )
 LOAD_STAGE1_CHECKPOINT = env_bool("LOAD_STAGE1_CHECKPOINT", True)
-
 
 
 def _load_adapter_from_checkpoint(
@@ -197,7 +192,6 @@ def _asr_forward_loss(
     micro_batch_size: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Run frozen LM loss; micro-batch to cap activation memory."""
     n = inputs_embeds.shape[0]
     chunk = max(1, min(micro_batch_size, n))
     if chunk >= n:
@@ -219,6 +213,89 @@ def _asr_forward_loss(
             )
         losses.append(out.loss)
     return torch.stack(losses).mean()
+
+
+def _forward_utterance_tokens(
+    *,
+    adapter: StreamingAdapter,
+    audio_extractor: WhisperWindowFeatureExtractor,
+    audio_path: str,
+    train_device: torch.device,
+    max_windows_per_utt: int | None,
+) -> tuple[torch.Tensor | None, torch.Tensor, int]:
+    """Encode one utterance; returns (tokens, stability_sum, num_windows)."""
+    wave = load_mono_waveform_16k(audio_path)
+    windows = audio_extractor.waveform_to_windows(wave)
+    if max_windows_per_utt is not None:
+        windows = windows[:max_windows_per_utt]
+    if not windows:
+        return None, torch.zeros((), device=train_device, dtype=torch.float32), 0
+
+    adapter.reset_streaming_state()
+    utterance_tokens: list[torch.Tensor] = []
+    stability_sum = torch.zeros((), device=train_device, dtype=torch.float32)
+    for window in windows:
+        result = adapter.forward_window(window.to(device=train_device, dtype=TORCH_DTYPE))
+        utterance_tokens.append(result["tokens"])
+        stability_sum = stability_sum + result["stability_loss"].float()
+    return torch.cat(utterance_tokens, dim=1), stability_sum, len(windows)
+
+
+def _pipeline_begin_microbatch(pipeline: TrainingPipeline) -> None:
+    if pipeline.accum_step == 0:
+        pipeline.optimizer.zero_grad(set_to_none=True)
+
+
+def _pipeline_accumulate_backward(
+    pipeline: TrainingPipeline,
+    loss: torch.Tensor,
+    *,
+    no_sync_modules: tuple[torch.nn.Module, ...] | None,
+    sync_grads: bool,
+) -> None:
+    scaled = loss / pipeline.gradient_accumulation_steps
+    use_no_sync = no_sync_modules is not None and not sync_grads
+    if use_no_sync:
+        with ExitStack() as stack:
+            for module in no_sync_modules:
+                if isinstance(module, DDP):
+                    stack.enter_context(module.no_sync())
+            scaled.backward()
+    else:
+        scaled.backward()
+
+
+def _pipeline_end_microbatch(
+    pipeline: TrainingPipeline,
+    params: list[torch.nn.Parameter],
+) -> bool:
+    """Apply optimizer/scheduler after manual backward(s). Returns True if stepped."""
+    pipeline._accum_step += 1
+    if pipeline._accum_step < pipeline.gradient_accumulation_steps:
+        return False
+
+    pipeline._accum_step = 0
+    for p in params:
+        if p.grad is not None:
+            p.grad = torch.where(
+                torch.isnan(p.grad) | torch.isinf(p.grad),
+                torch.zeros_like(p.grad),
+                p.grad,
+            )
+
+    has_nan = any(torch.isnan(p.grad).any() for p in params if p.grad is not None)
+    if has_nan:
+        print(f"[WARN] Step {pipeline.global_step}: NaN gradients detected, skipping update")
+        pipeline.global_step += 1
+        return True
+
+    if pipeline.grad_clip_norm > 0:
+        torch.nn.utils.clip_grad_norm_(params, pipeline.grad_clip_norm)
+    pipeline.optimizer.step()
+    if pipeline.scheduler is not None:
+        pipeline.scheduler.step()
+    pipeline.global_step += 1
+    return True
 
 
 def _unwrap(module: torch.nn.Module) -> torch.nn.Module:
@@ -252,7 +329,6 @@ def _build_inputs_for_asr(
     text_embedder: torch.nn.Module,
     llm_device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build [audio | BOS | teacher-forced text] embeddings and labels."""
     bos_token_id = (
         llm_tokenizer.bos_token_id
         if llm_tokenizer.bos_token_id is not None
@@ -261,7 +337,7 @@ def _build_inputs_for_asr(
     bos_embed = text_embedder(
         torch.tensor([[bos_token_id]], device=llm_device).expand(audio_tokens.shape[0], -1)
     )
-    inputs_embeds = torch.cat([audio_tokens.to(llm_device), bos_embed], dim=1)
+    inputs_embeds = torch.cat([audio_tokens.to(device=llm_device, dtype=LLM_DTYPE), bos_embed], dim=1)
 
     batch_size = audio_tokens.shape[0]
     audio_len = audio_tokens.shape[1]
@@ -286,66 +362,32 @@ def _encode_utterance(
     max_windows_per_utt: int | None,
     collect_aux_metrics: bool = False,
 ) -> UtteranceEncodeResult | None:
-    """window → encoder → adapter for one utterance."""
-    wave = load_mono_waveform_16k(audio_path)
-    windows = audio_extractor.waveform_to_windows(wave)
-    if max_windows_per_utt is not None:
-        windows = windows[:max_windows_per_utt]
-    if not windows:
-        return None
-
-    adapter.reset_streaming_state()
-    utterance_tokens: list[torch.Tensor] = []
-    stability_sum = 0.0
-    sparse_sum = 0.0
-    rate_sum = 0.0
-    for window in windows:
-        result = adapter.forward_window(window.to(device=train_device, dtype=TORCH_DTYPE))
-        utterance_tokens.append(result["tokens"])
-        if collect_aux_metrics:
-            stability_sum += float(result["stability_loss"].detach().float().item())
-            if result["sparse_loss"] is not None:
-                sparse_sum += float(result["sparse_loss"].detach().float().item())
-            if result["rate_loss"] is not None:
-                rate_sum += float(result["rate_loss"].detach().float().item())
-
-    return UtteranceEncodeResult(
-        tokens=torch.cat(utterance_tokens, dim=1),
-        num_windows=len(windows),
-        stability_loss=stability_sum,
-        sparse_loss=sparse_sum,
-        rate_loss=rate_sum,
-    )
-
-
-def _encode_utterance_tokens(
-    *,
-    adapter: StreamingAdapter,
-    audio_extractor: WhisperWindowFeatureExtractor,
-    audio_path: str,
-    train_device: torch.device,
-    max_windows_per_utt: int | None,
-) -> torch.Tensor | None:
-    encoded = _encode_utterance(
+    tokens, stability_sum, num_windows = _forward_utterance_tokens(
         adapter=adapter,
         audio_extractor=audio_extractor,
         audio_path=audio_path,
         train_device=train_device,
         max_windows_per_utt=max_windows_per_utt,
     )
-    return encoded.tokens if encoded is not None else None
+    if tokens is None:
+        return None
+    stability_val = float(stability_sum.detach().item()) if collect_aux_metrics else 0.0
+    return UtteranceEncodeResult(
+        tokens=tokens,
+        num_windows=num_windows,
+        stability_loss=stability_val,
+    )
 
 
-def _compute_aux_loss_metrics(
+def _compute_val_aux_metrics(
     *,
     audio_tokens: torch.Tensor,
     gt_embeds: torch.Tensor,
     total_stability_loss: float,
-    total_sparse_loss: float,
-    total_rate_loss: float,
     total_windows: int,
+    total_sparse_loss: float = 0.0,
+    total_rate_loss: float = 0.0,
 ) -> dict[str, float]:
-    """Monitoring-only auxiliary losses (detached; not used for backprop)."""
     with torch.no_grad():
         align_loss = float(
             contrastive_infonce_loss(
@@ -354,26 +396,11 @@ def _compute_aux_loss_metrics(
                 temperature=STAGE.temperature,
             ).item()
         )
-
-    if total_windows > 0:
-        stability_loss = total_stability_loss / float(total_windows)
-        sparse_loss = total_sparse_loss / float(total_windows)
-        rate_loss = total_rate_loss / float(total_windows)
-    else:
-        stability_loss = 0.0
-        sparse_loss = 0.0
-        rate_loss = 0.0
-
-    return {
-        "align": align_loss,
-        "stability": stability_loss,
-        "sparse": sparse_loss,
-        "rate": rate_loss,
-        "gate": 0.0,
-    }
+    stability_loss = total_stability_loss / float(total_windows) if total_windows > 0 else 0.0
+    return {"align": align_loss, "stability": stability_loss}
 
 
-def _build_stage2_lr_scheduler(
+def _build_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     *,
     total_steps: int,
@@ -419,7 +446,7 @@ def _make_checkpoint(
         scheduler_state_dict=scheduler.state_dict(),
         metrics=metrics,
         hyperparams={
-            "trainer": "adapter_asr_only_trainer",
+            "trainer": "adapter_asr_align_trainer",
             "stage_cfg": STAGE.__dict__,
             "grad_accum_steps": DATA.gradient_accumulation_steps(),
         },
@@ -483,10 +510,7 @@ def _resume_training_state(
         try:
             optimizer.load_state_dict(opt_state)
         except (ValueError, KeyError):
-            print(
-                "[WARN] Optimizer state incompatible with current adapter "
-                "(e.g. rate_controller removed); restarting optimizer."
-            )
+            print("[WARN] Optimizer state incompatible; restarting optimizer.")
     sched_state = resume_ckpt.get("scheduler_state_dict")
     if sched_state:
         try:
@@ -515,21 +539,25 @@ def train() -> None:
     llm_load_device = torch.device(llm_device_str)
     ensure_device_ready(llm_load_device)
 
-    if ctx.is_main:
-        print(f"Training device: {train_device_str} (configured: {DEVICE_CFG.device})")
-        print(f"LLM device: {llm_device_str} (configured: {DEVICE_CFG.llm_device or train_device_str})")
-        print(f"Visible CUDA devices: {ctx.num_cuda_devices}")
-        print(f"Distributed: world_size={ctx.world_size} rank={ctx.rank}")
-        print(f"Model parallel (LLM auto-shard): {ctx.model_parallel}")
-        print("Pipeline: window → encoder → adapter → LLM (ASR backprop only; aux losses logged)")
+    use_align = STAGE.lambda_align > 0
+    use_stability = STAGE.lambda_stability > 0
 
-    audio = WhisperWindowFeatureExtractor(
-        model_id=WHISPER_MODEL, device=train_device_str, torch_dtype=TORCH_DTYPE
-    )
+    if ctx.is_main:
+        print(f"Training device: {train_device_str} (Whisper + adapter)")
+        print(f"LLM device: {llm_device_str}")
+        print(f"Visible CUDA devices: {ctx.num_cuda_devices}")
+        if train_device_str == "cpu" and llm_device_str.startswith("cuda"):
+            print("Split layout: encode on CPU, ASR loss on GPU.")
+        print(
+            "Pipeline: window → encoder → adapter (stability buffer) → LLM | "
+            "loss = ASR + λ_align·align + λ_stability·stability"
+        )
 
     if llm_load_device.type == "cuda":
         with torch.cuda.device(llm_load_device):
             torch.cuda.empty_cache()
+
+    qwen_max_memory = adjust_llm_max_memory_for_free_vram(qwen_max_memory)
 
     if ctx.is_main:
         print(f"Qwen device_map: {qwen_map!r}")
@@ -539,7 +567,7 @@ def train() -> None:
     qwen_models = load_frozen_qwen_causal_lm(
         model_id=LLM_MODEL_ID,
         device=llm_device_str,
-        torch_dtype=TORCH_DTYPE,
+        torch_dtype=LLM_DTYPE,
         device_map=qwen_map,
         max_memory=qwen_max_memory,
     )
@@ -548,16 +576,23 @@ def train() -> None:
     text_embedder = qwen_models.embedder
     llm_device = llm_input_device(llm_model)
 
-    if STAGE.enable_llm_gradient_checkpointing and hasattr(llm_model, "gradient_checkpointing_enable"):
-        llm_model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-        )
     if hasattr(llm_model, "enable_input_require_grads"):
         llm_model.enable_input_require_grads()
 
-    llm_model.train()
+    if STAGE.enable_llm_gradient_checkpointing and hasattr(llm_model, "gradient_checkpointing_enable"):
+        llm_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
+    llm_model.eval()
     for p in llm_model.parameters():
         p.requires_grad = False
+
+    if ctx.is_main:
+        print("Loading Whisper on CPU...")
+    audio = WhisperWindowFeatureExtractor(
+        model_id=WHISPER_MODEL, device=train_device_str, torch_dtype=TORCH_DTYPE
+    )
 
     adapter = StreamingAdapter(
         d_encoder=WHISPER_DIM,
@@ -583,15 +618,12 @@ def train() -> None:
         if int(resume_meta.get("stage", 2)) == 1:
             adapter_init_path = resume_path
             if ctx.is_main:
-                print(
-                    f"RESUME_CHECKPOINT is Stage 1 ({resume_path}); "
-                    "loading adapter weights only (fresh ASR optimizer/scheduler)."
-                )
+                print(f"RESUME_CHECKPOINT is Stage 1 ({resume_path}); adapter weights only.")
         else:
             resume_ckpt = torch.load(resume_path, map_location=train_device)
             resume_training_state = True
             if ctx.is_main:
-                print(f"Will resume ASR-only training from checkpoint: {resume_path}")
+                print(f"Will resume from checkpoint: {resume_path}")
     elif LOAD_STAGE1_CHECKPOINT:
         if not os.path.isfile(STAGE1_SAVE_PATH):
             raise FileNotFoundError(
@@ -599,9 +631,9 @@ def train() -> None:
             )
         adapter_init_path = STAGE1_SAVE_PATH
         if ctx.is_main:
-            print(f"Will init adapter from Stage 1 checkpoint: {STAGE1_SAVE_PATH}")
+            print(f"Will init adapter from Stage 1: {STAGE1_SAVE_PATH}")
     elif ctx.is_main:
-        print("Adapter: random init (no Stage 1 or ASR-only checkpoint found)")
+        print("Adapter: random init")
 
     if adapter_init_path is not None and not resume_training_state:
         init_ckpt = torch.load(adapter_init_path, map_location=train_device)
@@ -618,13 +650,10 @@ def train() -> None:
     if ctx.is_main:
         print(
             f"Models initialized:\n"
-            f"  Encoder: frozen Whisper ({WHISPER_MODEL})\n"
-            f"  Adapter: trainable"
-            f"{' (Stage 1 init)' if adapter_init_path and not resume_training_state else ''}"
-            f"{' (resuming ASR-only)' if resume_training_state else ''}"
-            f" (fixed 2 tokens/window, no rate controller)\n"
-            f"  LLM: frozen ({LLM_MODEL_ID})\n"
-            f"  Checkpoint basename: {CHECKPOINT_BASENAME}\n"
+            f"  Encoder: frozen Whisper\n"
+            f"  Adapter: trainable (stability buffer, no rate controller)\n"
+            f"  LLM: frozen\n"
+            f"  Checkpoint: {CHECKPOINT_BASENAME}\n"
         )
 
     optimizer = torch.optim.AdamW(_unwrap(adapter).parameters(), lr=OPT.lr, weight_decay=OPT.weight_decay)
@@ -651,7 +680,7 @@ def train() -> None:
     micro_steps_per_epoch = len(dataloader)
     optimizer_steps_per_epoch = max(1, (micro_steps_per_epoch + grad_accum_steps - 1) // grad_accum_steps)
     total_steps = max(1, STAGE.epochs * optimizer_steps_per_epoch)
-    scheduler = _build_stage2_lr_scheduler(optimizer, total_steps=total_steps)
+    scheduler = _build_lr_scheduler(optimizer, total_steps=total_steps)
     pipeline.scheduler = scheduler
 
     if ctx.is_main:
@@ -663,12 +692,13 @@ def train() -> None:
         entity=WANDB.entity,
         run_name=WANDB.run_name,
         config={
-            "trainer": "adapter_asr_only",
+            "trainer": "adapter_asr_align",
             "data": {**DATA.__dict__, "dataset_roots": DATASET_ROOTS, "val_root": VAL_ROOT},
             "optim": OPT.__dict__,
             "stage_cfg": STAGE.__dict__,
             "device": DEVICE_CFG.__dict__,
             "checkpoint_basename": CHECKPOINT_BASENAME,
+            "stage1_checkpoint": STAGE1_SAVE_PATH,
             "world_size": ctx.world_size,
         },
     )
@@ -695,36 +725,20 @@ def train() -> None:
             print(
                 f"  Resumed at epoch {start_epoch + 1}/{STAGE.epochs}, "
                 f"global_step {pipeline.global_step}, "
-                f"dataloader offset {resume_batch_offset}/{len(dataloader)}\n"
+                f"offset {resume_batch_offset}/{len(dataloader)}\n"
             )
 
     if ctx.is_main:
-        print("\nStarting ASR-only training")
-        print(f"  Dataset splits: {', '.join(os.path.basename(r) for r in DATASET_ROOTS)}")
-        print(f"  Epochs: {STAGE.epochs}")
-        print(f"  Micro-batch size: {DATA.batch_size}")
-        print(f"  Effective batch size: {effective_batch_size}")
-        print(f"  Learning rate: {OPT.lr}")
-        print(f"  Max text tokens: {STAGE.max_text_tokens}")
-        print(f"  ASR micro-batch: {STAGE.asr_micro_batch_size}")
-        print(
-            "  Aux losses: align/stability/rate/sparse/gate logged (monitoring only; "
-            "rate/sparse/gate are 0 without rate controller / early-commit gate)"
-        )
+        print("\nStarting ASR + align + stability training")
+        print(f"  Dataset: {', '.join(os.path.basename(r) for r in DATASET_ROOTS)}")
+        print(f"  Epochs: {STAGE.epochs} | batch: {DATA.batch_size} | effective: {effective_batch_size}")
+        print(f"  λ_align: {STAGE.lambda_align} | λ_stability: {STAGE.lambda_stability}")
+        print(f"  InfoNCE temperature: {STAGE.temperature}")
+        print(f"  Stage 1 init: {STAGE1_SAVE_PATH}")
         if STAGE.val_enabled and os.path.isdir(VAL_ROOT):
-            cap = STAGE.val_max_utterances
-            cap_str = "all" if cap is None else str(cap)
-            print(
-                f"  Validation: dev-clean ({VAL_ROOT}), every {STAGE.val_every_steps} steps, "
-                f"{cap_str} utterances, losses (ASR+aux) + decode WER/BLEU-4"
-            )
-        if SAVE_EVERY_STEPS > 0:
-            print(
-                f"  Checkpoints: every {SAVE_EVERY_STEPS} steps -> "
-                f"{CKPT.dir}/{CHECKPOINT_BASENAME}_step<N>.pt (and {SAVE_PATH})"
-            )
+            print(f"  Validation: dev-clean every {STAGE.val_every_steps} steps")
         print(f"  LM conditioning: {TRAIN_STYLE_CONDITIONING}")
-        print(f"  Stage 3 target ({PROMPT_CONDITIONING}): {DEFAULT_ASR_PROMPT[:72]}...\n")
+        print(f"  Stage 3 target: {DEFAULT_ASR_PROMPT[:72]}...\n")
 
     adapter_module = _unwrap(adapter)
 
@@ -732,12 +746,10 @@ def train() -> None:
         if sampler is not None:
             sampler.set_epoch(epoch)
 
+        m_total = RunningMean()
         m_asr = RunningMean()
         m_align = RunningMean()
         m_stab = RunningMean()
-        m_sparse = RunningMean()
-        m_rate = RunningMean()
-        m_gate = RunningMean()
 
         if ctx.is_main:
             print(f"\n{'=' * 60}\nEpoch {epoch + 1}/{STAGE.epochs}\n{'=' * 60}\n")
@@ -748,82 +760,139 @@ def train() -> None:
                 continue
 
             audio_paths, transcriptions = batch
-            gt_tokens = llm_tokenizer(
-                list(transcriptions),
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=STAGE.max_text_tokens,
-            ).to(train_device)
-
-            with torch.no_grad():
-                gt_embeds = text_embedder(gt_tokens.input_ids.to(llm_device)).to(train_device)
-
-            audio_tokens_list: list[torch.Tensor] = []
-            total_windows = 0
-            total_stability_loss = 0.0
-            total_sparse_loss = 0.0
-            total_rate_loss = 0.0
-            for p in audio_paths:
-                encoded = _encode_utterance(
-                    adapter=adapter_module,
-                    audio_extractor=audio,
-                    audio_path=p,
-                    train_device=train_device,
-                    max_windows_per_utt=DATA.max_windows_per_utt,
-                    collect_aux_metrics=True,
-                )
-                if encoded is not None:
-                    audio_tokens_list.append(encoded.tokens)
-                    total_windows += encoded.num_windows
-                    total_stability_loss += encoded.stability_loss
-                    total_sparse_loss += encoded.sparse_loss
-                    total_rate_loss += encoded.rate_loss
-
-            if not audio_tokens_list:
-                if ctx.is_main:
-                    print(f"[WARN] Step {step}: empty batch (no audio windows); skipping.")
+            items = list(zip(audio_paths, transcriptions, strict=True))
+            if not items:
                 continue
 
-            audio_tokens = _pad_audio_tokens(audio_tokens_list)
-            aux_metrics = _compute_aux_loss_metrics(
-                audio_tokens=audio_tokens,
-                gt_embeds=gt_embeds,
-                total_stability_loss=total_stability_loss,
-                total_sparse_loss=total_sparse_loss,
-                total_rate_loss=total_rate_loss,
-                total_windows=total_windows,
-            )
-            inputs_embeds, labels, attention_mask = _build_inputs_for_asr(
-                audio_tokens=audio_tokens,
-                gt_ids=gt_tokens.input_ids,
-                gt_attention_mask=gt_tokens.attention_mask,
-                llm_tokenizer=llm_tokenizer,
-                text_embedder=text_embedder,
-                llm_device=llm_device,
-            )
-            asr_loss = _asr_forward_loss(
-                llm_model,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                attention_mask=attention_mask,
-                micro_batch_size=STAGE.asr_micro_batch_size,
-                device=llm_device,
-            )
+            work: list[tuple[str, str, torch.Tensor, torch.Tensor, int]] = []
+            for audio_path, text in items:
+                tokens, stability_sum, num_windows = _forward_utterance_tokens(
+                    adapter=adapter_module,
+                    audio_extractor=audio,
+                    audio_path=audio_path,
+                    train_device=train_device,
+                    max_windows_per_utt=DATA.max_windows_per_utt,
+                )
+                if tokens is None or num_windows == 0:
+                    continue
+                work.append((audio_path, text, tokens, stability_sum, num_windows))
 
+            if not work:
+                if ctx.is_main:
+                    print(f"[WARN] Step {step}: empty batch; skipping.")
+                continue
+
+            n_valid = len(work)
+            _pipeline_begin_microbatch(pipeline)
             no_sync_modules = (adapter,) if ctx.world_size > 1 else None
-            optimizer_stepped = pipeline.step(
-                asr_loss,
-                list(adapter_module.parameters()),
-                no_sync_modules=no_sync_modules,
+            at_accum_boundary = pipeline.is_accumulation_boundary
+
+            asr_vals: list[float] = []
+            stab_vals: list[float] = []
+
+            for utt_idx, (_path, text, tokens, stability_sum, num_windows) in enumerate(work):
+                gt_single = llm_tokenizer(
+                    [text],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=STAGE.max_text_tokens,
+                ).to(train_device)
+
+                inputs_embeds, labels, attention_mask = _build_inputs_for_asr(
+                    audio_tokens=tokens,
+                    gt_ids=gt_single.input_ids,
+                    gt_attention_mask=gt_single.attention_mask,
+                    llm_tokenizer=llm_tokenizer,
+                    text_embedder=text_embedder,
+                    llm_device=llm_device,
+                )
+                asr_loss = _asr_forward_loss(
+                    llm_model,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    micro_batch_size=1,
+                    device=llm_device,
+                )
+                asr_vals.append(asr_loss.detach().item())
+
+                utt_loss = asr_loss / float(n_valid)
+                if use_stability:
+                    stability_loss = stability_sum / float(num_windows)
+                    stab_vals.append(float(stability_loss.detach().item()))
+                    utt_loss = utt_loss + (STAGE.lambda_stability * stability_loss) / float(n_valid)
+
+                is_last_utt = utt_idx == n_valid - 1
+                sync_asr = is_last_utt and not (use_align and n_valid >= 2) and at_accum_boundary
+                _pipeline_accumulate_backward(
+                    pipeline,
+                    utt_loss,
+                    no_sync_modules=no_sync_modules,
+                    sync_grads=sync_asr,
+                )
+
+                if train_device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            align_loss = torch.tensor(0.0, device=train_device)
+            if use_align and n_valid >= 2:
+                align_tokens: list[torch.Tensor] = []
+                texts_for_align: list[str] = []
+                for audio_path, text, _tokens, _stab, num_windows in work:
+                    tokens, _, _ = _forward_utterance_tokens(
+                        adapter=adapter_module,
+                        audio_extractor=audio,
+                        audio_path=audio_path,
+                        train_device=train_device,
+                        max_windows_per_utt=DATA.max_windows_per_utt,
+                    )
+                    if tokens is None or num_windows == 0:
+                        continue
+                    align_tokens.append(tokens)
+                    texts_for_align.append(text)
+
+                if len(align_tokens) >= 2:
+                    gt_align = llm_tokenizer(
+                        texts_for_align,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=STAGE.max_text_tokens,
+                    ).to(train_device)
+                    with torch.no_grad():
+                        gt_embeds = text_embedder(gt_align.input_ids.to(llm_device)).to(train_device)
+                    audio_tokens = _pad_audio_tokens(align_tokens)
+                    align_loss = contrastive_infonce_loss(
+                        audio_tokens=audio_tokens.float(),
+                        text_embeddings=gt_embeds.float(),
+                        temperature=STAGE.temperature,
+                    )
+                    _pipeline_accumulate_backward(
+                        pipeline,
+                        STAGE.lambda_align * align_loss,
+                        no_sync_modules=no_sync_modules,
+                        sync_grads=at_accum_boundary,
+                    )
+
+            asr_mean = sum(asr_vals) / len(asr_vals)
+            stab_mean = sum(stab_vals) / len(stab_vals) if stab_vals else 0.0
+            align_val = float(align_loss.detach().item())
+            total_loss_val = (
+                asr_mean
+                + STAGE.lambda_align * align_val
+                + (STAGE.lambda_stability * stab_mean if use_stability else 0.0)
             )
 
-            m_asr.update(asr_loss.item())
-            m_align.update(aux_metrics["align"])
-            m_stab.update(aux_metrics["stability"])
-            m_sparse.update(aux_metrics["sparse"])
-            m_rate.update(aux_metrics["rate"])
-            m_gate.update(aux_metrics["gate"])
+            optimizer_stepped = _pipeline_end_microbatch(
+                pipeline,
+                list(adapter_module.parameters()),
+            )
+
+            m_total.update(total_loss_val)
+            m_asr.update(asr_mean)
+            m_align.update(align_val)
+            m_stab.update(stab_mean)
 
             accum_suffix = ""
             if grad_accum_steps > 1:
@@ -834,21 +903,18 @@ def train() -> None:
                 current_lr = scheduler.get_last_lr()[0]
                 print(
                     f"Micro {step:4d}/{len(dataloader)} | opt {pipeline.global_step:5d} | "
-                    f"ASR: {asr_loss.item():.4f} | Align: {aux_metrics['align']:.4f} | "
-                    f"Stab: {aux_metrics['stability']:.4f} | "
-                    f"Rate: {aux_metrics['rate']:.4f} | Gate: {aux_metrics['gate']:.4f} | "
-                    f"Sparse: {aux_metrics['sparse']:.4f} | LR: {current_lr:.2e}{accum_suffix}"
+                    f"Loss: {total_loss_val:.4f} | ASR: {asr_mean:.4f} | "
+                    f"Align: {align_val:.4f} | Stab: {stab_mean:.4f} | "
+                    f"LR: {current_lr:.2e}{accum_suffix}"
                 )
 
             if ctx.is_main and optimizer_stepped:
                 logger.log(
                     {
-                        "train/asr": asr_loss.item(),
-                        "train/align": aux_metrics["align"],
-                        "train/stability": aux_metrics["stability"],
-                        "train/rate": aux_metrics["rate"],
-                        "train/gate": aux_metrics["gate"],
-                        "train/sparse_metric": aux_metrics["sparse"],
+                        "train/loss": total_loss_val,
+                        "train/asr": asr_mean,
+                        "train/align": align_val,
+                        "train/stability": stab_mean,
                         "train/lr": current_lr,
                     },
                     step=pipeline.global_step,
@@ -885,7 +951,7 @@ def train() -> None:
                     ),
                     build_inputs_for_asr_fn=_build_inputs_for_asr,
                     asr_forward_loss_fn=lambda **kwargs: _asr_forward_loss(llm_model, **kwargs),
-                    compute_aux_loss_metrics_fn=_compute_aux_loss_metrics,
+                    compute_aux_loss_metrics_fn=_compute_val_aux_metrics,
                     val_root=VAL_ROOT,
                     train_device=train_device,
                     llm_device=llm_device,
@@ -911,13 +977,10 @@ def train() -> None:
                     scheduler=scheduler,
                     pipeline=pipeline,
                     metrics={
-                        "loss": m_asr.mean,
+                        "loss": m_total.mean,
                         "asr": m_asr.mean,
                         "align": m_align.mean,
                         "stability": m_stab.mean,
-                        "rate": m_rate.mean,
-                        "gate": m_gate.mean,
-                        "sparse": m_sparse.mean,
                     },
                 )
 
@@ -927,13 +990,10 @@ def train() -> None:
 
         if ctx.is_main:
             epoch_metrics = {
-                "loss": m_asr.mean,
+                "loss": m_total.mean,
                 "asr": m_asr.mean,
                 "align": m_align.mean,
                 "stability": m_stab.mean,
-                "rate": m_rate.mean,
-                "gate": m_gate.mean,
-                "sparse": m_sparse.mean,
             }
             ckpt = _make_checkpoint(
                 epoch=epoch + 1,
@@ -944,7 +1004,6 @@ def train() -> None:
                 metrics=epoch_metrics,
             )
             save_checkpoint(SAVE_PATH, ckpt)
-
             epoch_save_path = os.path.join(CKPT.dir, f"{CHECKPOINT_BASENAME}_epoch{epoch + 1}.pt")
             save_checkpoint(epoch_save_path, ckpt)
             maybe_upload_stage_epoch_checkpoint(
@@ -957,15 +1016,13 @@ def train() -> None:
                 enabled=HF_CKPT.upload_enabled,
             )
             print(
-                f"\nEpoch {epoch + 1} complete: "
-                f"ASR={m_asr.mean:.4f} align={m_align.mean:.4f} "
-                f"stab={m_stab.mean:.4f} rate={m_rate.mean:.4f} "
-                f"gate={m_gate.mean:.4f} sparse={m_sparse.mean:.4f}\n"
-                f"Checkpoint -> {SAVE_PATH}\n"
+                f"\nEpoch {epoch + 1} complete: loss={m_total.mean:.4f} "
+                f"asr={m_asr.mean:.4f} align={m_align.mean:.4f} "
+                f"stab={m_stab.mean:.4f}\nCheckpoint -> {SAVE_PATH}\n"
             )
 
     if ctx.is_main:
-        print("ASR-only training complete!")
+        print("ASR + align + stability training complete!")
         logger.finish()
     cleanup_distributed()
 

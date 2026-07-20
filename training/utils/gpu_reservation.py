@@ -53,8 +53,47 @@ def visible_physical_gpu_indices() -> list[int]:
     return list(range(count)) if count > 0 else []
 
 
+def _logical_cuda_index_from_env(env_key: str) -> int | None:
+    """Logical CUDA index from ``DEVICE`` / ``LLM_DEVICE`` (e.g. ``cuda:1`` → ``1``)."""
+    raw = env_str(env_key)
+    if not raw:
+        return None
+    normalized = raw.strip().lower()
+    if normalized.startswith("cuda:") and normalized != "cuda":
+        return int(normalized.split(":", 1)[1])
+    return None
+
+
+def _parse_llm_max_memory_env() -> dict[int | str, str] | None:
+    raw = env_str("LLM_MAX_MEMORY")
+    if not raw or not raw.strip():
+        return None
+    result: dict[int | str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        idx_str, _, size = part.partition(":")
+        idx_str = idx_str.strip().lower()
+        size = size.strip()
+        if not idx_str or not size:
+            continue
+        key: int | str = "cpu" if idx_str == "cpu" else int(idx_str)
+        result[key] = size
+    return result if result else None
+
+
+def _map_logical_to_physical(visible: list[int], logical_idx: int) -> int:
+    if logical_idx < 0 or logical_idx >= len(visible):
+        raise RuntimeError(
+            f"Logical cuda:{logical_idx} is out of range for visible GPUs {visible} "
+            f"(CUDA_VISIBLE_DEVICES={env_str('CUDA_VISIBLE_DEVICES')!r})"
+        )
+    return visible[logical_idx]
+
+
 def gpu_indices_for_process(*, local_rank: int, world_size: int) -> list[int]:
-    """GPUs this process should lock (all visible in MP; one per rank in DDP)."""
+    """GPUs this process should lock (DDP: one per rank; else env-selected set)."""
     visible = visible_physical_gpu_indices()
     if not visible:
         return []
@@ -65,6 +104,23 @@ def gpu_indices_for_process(*, local_rank: int, world_size: int) -> list[int]:
                 f"({visible}); increase CUDA_VISIBLE_DEVICES or lower nproc_per_node."
             )
         return [visible[local_rank]]
+
+    reserved: set[int] = set()
+    for env_key in ("DEVICE", "LLM_DEVICE"):
+        logical = _logical_cuda_index_from_env(env_key)
+        if logical is not None:
+            reserved.add(_map_logical_to_physical(visible, logical))
+
+    max_memory = _parse_llm_max_memory_env()
+    if max_memory:
+        for logical_idx in max_memory:
+            if isinstance(logical_idx, int):
+                reserved.add(_map_logical_to_physical(visible, logical_idx))
+
+    if reserved:
+        return sorted(reserved)
+
+    # Bare DEVICE=cuda with no explicit indices: legacy all-visible lock.
     return visible
 
 

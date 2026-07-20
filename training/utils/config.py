@@ -190,30 +190,32 @@ class Stage1Config:
     epochs: int = 10
     lambda_stability: float = 0.1
     # lambda_stability = 0.0
-    temperature: float = 14.3
+    temperature: float = 0.07
     val_enabled: bool = True
     val_every_steps: int = 1000
     val_max_utterances: int | None = None  # None = full dev-clean
 
-def _parse_llm_max_memory(raw: str | None) -> dict[int, str] | None:
+def _parse_llm_max_memory(raw: str | None) -> dict[int | str, str] | None:
     """
-    Parse ``LLM_MAX_MEMORY`` (e.g. ``0:15GiB,1:5GiB``) for HuggingFace ``max_memory``.
+    Parse ``LLM_MAX_MEMORY`` (e.g. ``0:10GiB,1:2GiB,cpu:64GiB``) for HuggingFace ``max_memory``.
 
-    Indices are logical CUDA device ids (``0``, ``1``, …) after ``CUDA_VISIBLE_DEVICES``.
+    Indices are logical CUDA device ids (``0``, ``1``, …) after ``CUDA_VISIBLE_DEVICES``,
+    plus optional ``cpu`` for CPU spill after GPU caps are filled.
     """
     if not raw or not raw.strip():
         return None
-    result: dict[int, str] = {}
+    result: dict[int | str, str] = {}
     for part in raw.split(","):
         part = part.strip()
         if not part:
             continue
         idx_str, _, size = part.partition(":")
-        idx_str = idx_str.strip()
+        idx_str = idx_str.strip().lower()
         size = size.strip()
         if not idx_str or not size:
             raise ValueError(f"Invalid LLM_MAX_MEMORY entry: {part!r}")
-        result[int(idx_str)] = size
+        key: int | str = "cpu" if idx_str == "cpu" else int(idx_str)
+        result[key] = size
     return result if result else None
 
 
@@ -228,7 +230,7 @@ class DeviceConfig:
 
     device: str = "cuda"
     llm_device: str | None = None
-    llm_max_memory: dict[int, str] | None = None
+    llm_max_memory: dict[int | str, str] | None = None
 
     @classmethod
     def from_env(cls) -> DeviceConfig:

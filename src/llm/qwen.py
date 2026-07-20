@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from .config import QwenConfig
 
@@ -15,6 +18,40 @@ class QwenModels:
     tokenizer: Any
     causal_lm: Any
     embedder: Any
+
+
+_EMBED_TOKENS_KEY = "model.embed_tokens.weight"
+
+
+def _load_embedder_only(*, model_id: str, torch_dtype: torch.dtype) -> torch.nn.Embedding:
+    """
+    Load only ``embed_tokens`` (~1.2 GiB for Qwen3-8B) instead of the full base model.
+
+    Stage 1 contrastive training needs embedding lookup only; loading ``AutoModel``
+    (~16 GiB) routinely OOMs on 16 GiB GPUs that already host Whisper + adapter.
+    """
+    config = AutoConfig.from_pretrained(model_id)
+    embedder = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+
+    index_path = hf_hub_download(model_id, "model.safetensors.index.json")
+    with open(index_path, encoding="utf-8") as f:
+        index = json.load(f)
+    weight_map: dict[str, str] = index["weight_map"]
+    weight_key = _EMBED_TOKENS_KEY
+    if weight_key not in weight_map:
+        for key in weight_map:
+            if key.endswith("embed_tokens.weight"):
+                weight_key = key
+                break
+        else:
+            raise KeyError(f"No embed_tokens weight in {model_id} weight map")
+    shard_path = hf_hub_download(model_id, weight_map[weight_key])
+    state = load_file(shard_path)
+    embedder.weight.data.copy_(state[weight_key].to(dtype=torch_dtype))
+    embedder.eval()
+    for param in embedder.parameters():
+        param.requires_grad = False
+    return embedder
 
 
 def load_qwen_models(
@@ -30,8 +67,8 @@ def load_qwen_models(
     """
     Load Qwen tokenizer and (optionally) the causal LM.
 
-    - **embeddings_only=True**: loads an `AutoModel` for `get_input_embeddings()` only.
-      This matches Stage 1 usage (contrastive alignment).
+    - **embeddings_only=True**: loads only ``embed_tokens`` weights (~1.2 GiB for
+      Qwen3-8B). This matches Stage 1 usage (contrastive alignment).
     - **embeddings_only=False**: loads full `AutoModelForCausalLM` for generation or LM loss.
     """
     if cfg is not None:
@@ -57,13 +94,8 @@ def load_qwen_models(
     target = torch.device(device)
 
     if embeddings_only:
-        model = AutoModel.from_pretrained(model_id, **load_kw)
-        if device_map is None:
-            model = model.to(target)
-        model.eval()
-        for p in model.parameters():
-            p.requires_grad = False
-        embedder = model.get_input_embeddings()
+        embedder = _load_embedder_only(model_id=model_id, torch_dtype=torch_dtype)
+        embedder = embedder.to(target)
         return QwenModels(model_id=model_id, tokenizer=tokenizer, causal_lm=None, embedder=embedder)
 
     causal_lm = AutoModelForCausalLM.from_pretrained(model_id, use_safetensors=True, **load_kw)

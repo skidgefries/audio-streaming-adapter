@@ -74,7 +74,7 @@ def resolve_llm_device_str(*, train_device: torch.device, llm_device: str | None
 
 def _build_llm_max_memory(
     *,
-    llm_max_memory: dict[int, str] | None,
+    llm_max_memory: dict[int | str, str] | None,
     primary_gpu_idx: int,
     default_primary_cap: str = "14.5GiB",
 ) -> dict[int | str, str]:
@@ -95,12 +95,64 @@ def _llm_device_map_for(max_memory: dict[int | str, str] | None) -> str | None:
     return "auto"
 
 
+def _parse_gib_cap(size: str) -> float:
+    raw = size.strip().upper().replace(" ", "")
+    if raw.endswith("GIB"):
+        return float(raw[:-3])
+    if raw.endswith("GB"):
+        return float(raw[:-2])
+    if raw.endswith("MIB"):
+        return float(raw[:-3]) / 1024.0
+    raise ValueError(f"Unsupported memory cap: {size!r}")
+
+
+def _format_gib_cap(gib: float) -> str:
+    return f"{max(0.5, gib):.1f}GiB"
+
+
+def adjust_llm_max_memory_for_free_vram(
+    max_memory: dict[int | str, str] | None,
+    *,
+    headroom_gib: float = 1.5,
+) -> dict[int | str, str] | None:
+    """
+    Lower per-GPU ``max_memory`` caps to fit *currently free* VRAM.
+
+    HuggingFace's loader warmup pre-allocates based on these caps; on shared GPUs a
+    configured ``0:14GiB`` cap can OOM even when weights would eventually spill to CPU.
+    """
+    if max_memory is None or not torch.cuda.is_available():
+        return max_memory
+    out: dict[int | str, str] = dict(max_memory)
+    for key in list(out):
+        if not isinstance(key, int):
+            continue
+        if key < 0 or key >= torch.cuda.device_count():
+            continue
+        free_bytes, total_bytes = torch.cuda.mem_get_info(key)
+        free_gib = free_bytes / (1024**3)
+        total_gib = total_bytes / (1024**3)
+        try:
+            cap_gib = _parse_gib_cap(out[key])
+        except ValueError:
+            continue
+        allowed = max(0.5, free_gib - headroom_gib)
+        if cap_gib > allowed:
+            new_cap = _format_gib_cap(allowed)
+            print(
+                f"  [VRAM] GPU {key}: LLM cap {out[key]} -> {new_cap} "
+                f"(free {free_gib:.1f}/{total_gib:.1f} GiB; shared GPU headroom {headroom_gib} GiB)"
+            )
+            out[key] = new_cap
+    return out
+
+
 def resolve_llm_load_plan(
     *,
     ctx: TrainingContext,
     train_device: torch.device,
     llm_device: str | None,
-    llm_max_memory: dict[int, str] | None,
+    llm_max_memory: dict[int | str, str] | None,
 ) -> tuple[str, str | dict | None, dict[int | str, str] | None]:
     """
     HuggingFace load plan for the frozen LLM.
@@ -132,8 +184,14 @@ def resolve_llm_load_plan(
         return llm_device_str, _llm_device_map_for(max_mem), max_mem
 
     if not split:
+        if llm_max_memory:
+            max_mem = _build_llm_max_memory(
+                llm_max_memory=llm_max_memory,
+                primary_gpu_idx=primary_gpu_idx,
+            )
+            return llm_device_str, _llm_device_map_for(max_mem), max_mem
         qwen_map = llm_device_map(ctx, max_memory=llm_max_memory)
-        return llm_device_str, qwen_map, llm_max_memory if qwen_map else None
+        return llm_device_str, qwen_map, None
 
     max_mem = _build_llm_max_memory(
         llm_max_memory=llm_max_memory,
@@ -174,6 +232,19 @@ def device_env_has_explicit_index() -> bool:
     """True when ``DEVICE`` names a specific GPU (e.g. ``cuda:1``), not bare ``cuda``."""
     raw = (env_str("DEVICE", "cuda") or "cuda").strip().lower()
     return raw.startswith("cuda:") and raw != "cuda"
+
+
+def device_env_allows_qwen_spill() -> bool:
+    """
+    True when frozen Qwen may shard across GPUs (cuda:0 fill, cuda:1 spill, then CPU).
+
+    ``DEVICE=cuda`` and ``DEVICE=cuda:0`` allow spill; ``DEVICE=cuda:1`` pins everything
+    on a non-primary GPU and disables multi-GPU sharding.
+    """
+    device = resolve_device()
+    if device.type != "cuda":
+        return False
+    return device.index is None or device.index == 0
 
 
 def init_cuda_devices() -> int:

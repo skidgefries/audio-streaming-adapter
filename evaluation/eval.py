@@ -69,10 +69,7 @@ from training.utils.devices import (
 )
 from training.utils.env import env_int, env_optional_int, load_project_env
 from training.utils.loaders import load_frozen_qwen_causal_lm, load_frozen_qwen_embeddings
-from training.utils.stage1_validation import (
-    compute_retrieval_metrics,
-    compute_retrieval_metrics_from_cost_matrix,
-)
+from training.utils.stage1_validation import compute_retrieval_recall
 
 
 def _load_adapter_state_dict(adapter: StreamingAdapter, ckpt: dict) -> None:
@@ -179,47 +176,6 @@ def load_retrieval_nll_matrix_checkpoint(path: Path) -> dict[str, Any] | None:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def slice_rank_only_nll_matrix(
-    saved: dict[str, Any],
-    *,
-    num_samples: int,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-    """
-    Return a square submatrix suitable for ranking from a (possibly partial) NLL cache.
-
-    Each completed row ``i`` is scored against all candidates; for ranking we use
-    ``matrix[:n, :n]`` where ``n = min(num_samples, rows_done, matrix_size)``.
-    """
-    matrix = saved["matrix"]
-    rows_done = int(saved["rows_done"])
-    matrix_n = int(matrix.shape[0])
-    if rows_done <= 0:
-        raise RuntimeError("No completed rows in saved NLL matrix")
-
-    n_rank = min(int(num_samples), rows_done, matrix_n)
-    if n_rank <= 0:
-        raise RuntimeError(
-            f"Cannot rank: num_samples={num_samples}, rows_done={rows_done}, matrix_n={matrix_n}"
-        )
-
-    info: dict[str, Any] = {
-        "matrix_rows_total": matrix_n,
-        "rows_done": rows_done,
-        "num_ranked": n_rank,
-        "matrix_complete": rows_done >= matrix_n,
-        "partial_rank": n_rank < matrix_n or rows_done < matrix_n,
-    }
-    if rows_done < num_samples:
-        print(
-            f"  [WARN] Matrix incomplete ({rows_done}/{matrix_n} rows); "
-            f"ranking on first {n_rank} completed queries only."
-        )
-    elif n_rank < matrix_n:
-        print(f"  Ranking on first {n_rank}/{matrix_n} queries (--num-samples).")
-
-    return matrix[:n_rank, :n_rank].clone(), info
-
-
 def save_retrieval_nll_audio_cache(path: Path, audio_tokens_list: list[torch.Tensor], texts: list[str], meta: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"version": 1, "audio_tokens_list": [t.cpu() for t in audio_tokens_list], "texts": texts, "meta": meta}, path)
@@ -308,43 +264,6 @@ def _interpret_cosine_r1(r1: float, *, stage: int) -> None:
         print("  R@1 < 10% — weak alignment; check checkpoint and rate-controller settings")
 
 
-def _print_retrieval_cosine_metrics(results: dict[str, float]) -> None:
-    print("\n" + "=" * 50)
-    print("RETRIEVAL METRICS — retrieval-cosine (Audio → Text)")
-    print("=" * 50)
-    print("  Retrieval:")
-    for k in (1, 5, 10):
-        print(f"    Recall@{k}: {results[f'R@{k}']:.2f}%")
-    print(f"    MRR:          {results['MRR']:.2f}%")
-    print(f"    Median Rank:  {results['median_rank']:.1f}")
-    print(f"    Mean Rank:    {results['mean_rank']:.1f}")
-    print("  Training objective:")
-    print(f"    InfoNCE Loss: {results['infonce_loss']:.4f}")
-    print("  Diagnostics:")
-    print(f"    Alignment:    {results['alignment']:.4f}")
-    print(f"    Uniformity:   {results['uniformity']:.4f}")
-    print("=" * 50)
-
-
-def _print_retrieval_nll_metrics(results: dict[str, float], *, stage: int) -> None:
-    header = "RETRIEVAL METRICS — retrieval-nll (Audio → Text)"
-    if stage == 2:
-        header = "RETRIEVAL METRICS — retrieval-nll, Stage 2 (Audio → Text)"
-    print("\n" + "=" * 50)
-    print(header)
-    print("=" * 50)
-    print("  Retrieval:")
-    for k in (1, 5, 10):
-        print(f"    Recall@{k}: {results[f'R@{k}']:.2f}%")
-    print(f"    MRR:          {results['MRR']:.2f}%")
-    print(f"    Median Rank:  {results['median_rank']:.1f}")
-    print(f"    Mean Rank:    {results['mean_rank']:.1f}")
-    print("  Training objective:")
-    print(f"    NLL (matched):     {results['nll']:.4f}")
-    print(f"    NLL (neg mean):    {results['nll_neg_mean']:.4f}")
-    print("=" * 50)
-
-
 # ---------------------------------------------------------------------------
 # Retrieval cosine
 # ---------------------------------------------------------------------------
@@ -401,6 +320,17 @@ def _load_cosine_models(
 
     return audio, qwen_models.tokenizer, qwen_models.embedder, adapter, llm_device, ckpt
 
+def _pad_audio_tokens(utterances: list[torch.Tensor]) -> torch.Tensor:
+    """Pad variable-length audio token sequences to a common length (matches training validation)."""
+    max_len = max(t.shape[1] for t in utterances)
+    padded = []
+    for t in utterances:
+        if t.shape[1] < max_len:
+            pad = torch.zeros(1, max_len - t.shape[1], t.shape[2], device=t.device, dtype=t.dtype)
+            t = torch.cat([t, pad], dim=1)
+        padded.append(t)
+    return torch.cat(padded, dim=0)
+
 @torch.no_grad()
 def _compute_cosine_embeddings(
     audio_extractor,
@@ -412,44 +342,57 @@ def _compute_cosine_embeddings(
     device: torch.device,
     llm_device: torch.device,
     max_text_tokens: int,
+    batch_size: int = 1,   
 ):
-    audio_vecs = []
-    text_vecs = []
+    
+    audio_vecs: list[torch.Tensor] = []
+    text_vecs: list[torch.Tensor] = []
+    n = len(pairs)
 
 
-    for i, (audio_path, transcription) in enumerate(pairs):
-        if i % 50 == 0:
-            print(f"  Processing {i}/{len(pairs)}...")
+    for i0 in range(0, n, batch_size):
+        if i0 % 50 == 0:
+            print(f"  Processing {i0}/{n}...")
 
-        wave = load_mono_waveform_16k(audio_path)
-        windows = audio_extractor.waveform_to_windows(wave)
-        if len(windows) == 0:
-            continue
-
-        adapter.reset_streaming_state()
-        chunks = []
-        with _maybe_autocast(device):
-            for w in windows:
-                out = adapter.forward_window(w)
-                chunks.append(out["tokens"])
-
-        audio_tokens = torch.cat(chunks, dim=1)
-        audio_pooled = audio_tokens.float().mean(dim=1)
-        audio_vecs.append(audio_pooled.squeeze(0).cpu())
+        batch_pairs = pairs[i0 : i0 + batch_size]
+        batch_texts = [transcription for _, transcription in batch_pairs]
 
         text_tokens = tokenizer(
-            transcription,
+            batch_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
             max_length=max_text_tokens,
         )
         label_embeds = text_embedder(text_tokens.input_ids.to(llm_device)).float()
-        text_pooled = label_embeds.mean(dim=1)
-        text_vecs.append(text_pooled.squeeze(0).cpu())
 
-    audio_bank = torch.stack(audio_vecs)
-    text_bank = torch.stack(text_vecs)
+        utterances: list[torch.Tensor] = []
+        with _maybe_autocast(device):
+            for audio_path, _ in batch_pairs:
+                wave = load_mono_waveform_16k(audio_path)
+                windows = audio_extractor.waveform_to_windows(wave)
+                adapter.reset_streaming_state()
+                chunks = []
+                for w in windows:
+                    out = adapter.forward_window(w)
+                    chunks.append(out["tokens"])
+                if chunks:
+                    utterances.append(torch.cat(chunks, dim=1))
+
+        if not utterances or len(utterances) != len(batch_pairs):
+            continue
+
+        audio_tokens = _pad_audio_tokens(utterances)
+        a_pooled = audio_tokens.float().mean(dim=1).cpu()
+        t_pooled = label_embeds.float().mean(dim=1).cpu()
+        audio_vecs.append(a_pooled)
+        text_vecs.append(t_pooled)
+
+    if not audio_vecs:
+        raise RuntimeError("No valid audio utterances found for cosine retrieval")
+
+    audio_bank = torch.cat(audio_vecs, dim=0)
+    text_bank = torch.cat(text_vecs, dim=0)
 
     audio_bank = audio_bank - audio_bank.mean(dim=0, keepdim=True)
     text_bank = text_bank - text_bank.mean(dim=0, keepdim=True)
@@ -460,7 +403,7 @@ def _compute_cosine_embeddings(
 
 
 def run_retrieval_cosine(*, stage: int, args: argparse.Namespace) -> None:
-    """Run cosine-similarity retrieval eval for stage 1 or 2."""
+    """Run cosine-similarity retrieval eval (R@1, R@5, R@10) for stage 1 or 2."""
     if stage not in (1, 2):
         raise ValueError(f"stage must be 1 or 2, got {stage}")
 
@@ -488,8 +431,11 @@ def run_retrieval_cosine(*, stage: int, args: argparse.Namespace) -> None:
     dataset = LibriSpeechPairs(args.dataset_root)
     pairs = dataset.pairs[:count]
     
-    print(f"Evaluating on {len(pairs)} utterances (run={run_name})\n")
     
+    print(
+        f"Evaluating on {len(pairs)} utterances "
+        f"(run={run_name}, batch={args.batch_size}, max_text_tokens={args.max_text_tokens})\n"
+    )
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
 
@@ -515,20 +461,24 @@ def run_retrieval_cosine(*, stage: int, args: argparse.Namespace) -> None:
         device=device,
         llm_device=llm_device,
         max_text_tokens=args.max_text_tokens,
+        batch_size=args.batch_size,
     )
     print(f"  Audio bank: {audio_bank.shape}")
     print(f"  Text bank:  {text_bank.shape}\n")
 
     print("Computing retrieval metrics...")
-    logit_scale = ckpt.get("contrastive_logit_scale")
-    results = compute_retrieval_metrics(
-        audio_bank,
-        text_bank,
-        ks=(1, 5, 10),
-        logit_scale=logit_scale,
-    )
+    recall = compute_retrieval_recall(audio_bank, text_bank)
+    results = {f"R@{k}": recall[f"recall_at_{k}"] for k in (1, 5, 10)}
 
-    _print_retrieval_cosine_metrics(results)
+    header = "RETRIEVAL RESULTS (Audio → Text)"
+    if stage == 2:
+        header = "RETRIEVAL RESULTS — Stage 2 checkpoint (Audio → Text)"
+    print("\n" + "=" * 50)
+    print(header)
+    print("=" * 50)
+    for k, v in results.items():
+        print(f"  {k}: {v:.2f}%")
+    print("=" * 50)
 
     print("\nInterpretation:")
     _interpret_cosine_r1(results["R@1"], stage=stage)
@@ -538,6 +488,8 @@ def run_retrieval_cosine(*, stage: int, args: argparse.Namespace) -> None:
         "checkpoint": args.checkpoint,
         "dataset_root": args.dataset_root,
         "num_utterances": len(pairs),
+        "batch_size": args.batch_size,
+        "max_text_tokens": args.max_text_tokens,
         "epoch": ckpt.get("epoch"),
         "global_step": ckpt.get("global_step"),
         "eval_type": "retrieval_cosine",
@@ -824,8 +776,21 @@ def _encode_and_cache_nll_audio(
     return audio_tokens_list, texts
 
 
+def _compute_recall_from_nll(nll_scores, ks=(1, 5, 10)):
+    n = nll_scores.shape[0]
+    ranked = nll_scores.argsort(dim=1, descending=False)
+
+    results = {}
+    for k in ks:
+        top_k = ranked[:, :k]
+        correct = torch.arange(n).unsqueeze(1)
+        hits = (top_k == correct).any(dim=1).float()
+        results[f"R@{k}"] = hits.mean().item() * 100
+    return results
+
+
 def run_retrieval_nll(*, stage: int, args: argparse.Namespace) -> None:
-    """Run NLL-scored retrieval eval for stage 1 or 2."""
+    """Run NLL-scored retrieval eval (R@1, R@5, R@10) for stage 1 or 2."""
     if stage not in (1, 2):
         raise ValueError(f"stage must be 1 or 2, got {stage}")
 
@@ -858,14 +823,18 @@ def run_retrieval_nll(*, stage: int, args: argparse.Namespace) -> None:
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     texts: list[str] | None = None
-    rank_info: dict[str, Any] | None = None
 
     if args.rank_only:
         saved = load_retrieval_nll_matrix_checkpoint(matrix_cache_path)
         if saved is None:
             raise FileNotFoundError(f"No saved matrix at {matrix_cache_path}")
+        if saved["rows_done"] < saved["matrix"].shape[0]:
+            raise RuntimeError(
+                f"Matrix at {matrix_cache_path} is incomplete "
+                f"({saved['rows_done']}/{saved['matrix'].shape[0]} rows)"
+            )
         print(f"Ranking from saved matrix {matrix_cache_path}")
-        nll_scores, rank_info = slice_rank_only_nll_matrix(saved, num_samples=count)
+        nll_scores = saved["matrix"]
     else:
         device, torch_dtype, num_cuda = init_eval_device()
         llm_map, llm_max_memory = qwen_device_map_and_max_memory(num_cuda_devices=num_cuda)
@@ -981,25 +950,30 @@ def run_retrieval_nll(*, stage: int, args: argparse.Namespace) -> None:
             )
 
     print("Computing retrieval metrics...")
-    results = compute_retrieval_metrics_from_cost_matrix(nll_scores, ks=(1, 5, 10))
+    results = _compute_recall_from_nll(nll_scores)
 
-    _print_retrieval_nll_metrics(results, stage=stage)
+    header = "RETRIEVAL RESULTS (Audio → Text, NLL)"
+    if stage == 2:
+        header = "RETRIEVAL RESULTS — Stage 2 checkpoint (Audio → Text, NLL)"
+    print("\n" + "=" * 50)
+    print(header)
+    print("=" * 50)
+    for k, v in results.items():
+        print(f"  {k}: {v:.2f}%")
+    print("=" * 50)
 
     meta: dict[str, Any] = {
         "run_name": run_name,
         "checkpoint": args.checkpoint,
         "dataset_root": args.dataset_root,
-        "num_utterances": nll_scores.shape[0],
+        "num_utterances": nll_scores.shape[0] if texts is None else len(texts),
         "candidate_batch_size": args.candidate_batch_size,
         "max_text_tokens": args.max_text_tokens,
         "epoch": ckpt.get("epoch"),
         "global_step": ckpt.get("global_step"),
         "eval_type": "retrieval_nll",
         "stage": stage,
-        "rank_only": bool(args.rank_only),
     }
-    if rank_info is not None:
-        meta.update(rank_info)
     if stage == 2 and stage2 is not None:
         meta["use_rate_controller"] = stage2.use_rate_controller
 
@@ -1580,7 +1554,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ckpt_cfg = CheckpointConfig.from_env(pkg_root=_pkg_root)
     default_checkpoint = os.path.join(ckpt_cfg.dir, "adapter_stage1.pt")
     default_test_root = LibriSpeechConfig.test_clean_root(_training_dir)
-    default_output_dir = os.path.join(_pkg_root, "outputs", "experiments", "July-3-eval")
+    default_output_dir = os.path.join(_pkg_root, "outputs", "experiments")
 
     ap = argparse.ArgumentParser(description="Stage 1 eval (retrieval-cosine | retrieval-nll | asr)")
     ap.add_argument("--metric", required=True, choices=EVAL_METRICS)
@@ -1602,6 +1576,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--run-name", type=str, default=None)
     ap.add_argument("--output-dir", type=str, default=default_output_dir)
     ap.add_argument("--max-text-tokens", type=int, default=None)
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Embedding batch size for retrieval-cosine (default 1)",
+    )
     ap.add_argument("--candidate-batch-size", type=int, default=None)
     ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--rank-only", action="store_true")
@@ -1655,9 +1635,14 @@ def _apply_device_override(device: str | None) -> None:
 
 def _apply_stage1_defaults(args: argparse.Namespace) -> None:
     
-    if args.metric == "retrieval-cosine" and args.max_text_tokens is None:
-        args.max_text_tokens = 128
-
+   
+    
+    if args.metric == "retrieval-cosine":
+        if args.max_text_tokens is None:
+            args.max_text_tokens = 128
+        if args.batch_size is None:
+            args.batch_size = env_int("RETRIEVAL_COSINE_BATCH_SIZE", 1)
+    
     
     if args.metric == "retrieval-nll":
         if args.max_text_tokens is None:

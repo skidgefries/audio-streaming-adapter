@@ -934,11 +934,11 @@ class WhisperAdapterLLMCommitGatePipeline:
 def _qwen_device_map_and_max_memory() -> tuple[str | None, dict[int, str] | None]:
     """LLM sharding for multi-GPU eval (matches ``evaluation.eval_stage1``)."""
     from training.utils.config import DeviceConfig
-    from training.utils.devices import device_env_has_explicit_index, visible_gpu_count
+    from training.utils.devices import device_env_allows_qwen_spill, visible_gpu_count
 
     n = visible_gpu_count()
     max_memory = DeviceConfig.from_env().llm_max_memory
-    if device_env_has_explicit_index():
+    if not device_env_allows_qwen_spill():
         return None, None
     if n >= 2 and max_memory:
         return "sequential", max_memory
