@@ -103,6 +103,7 @@ def resolve_resume_epoch_and_offset(
         steps_into_epoch = max(0, global_step - epoch_start_step)
         batch_offset = steps_into_epoch * saved_accum
         if batch_offset >= micro_steps_per_epoch:
+            start_epoch += batch_offset // micro_steps_per_epoch
             batch_offset = batch_offset % micro_steps_per_epoch
     else:
         batch_offset = global_step - start_epoch * micro_steps_per_epoch
@@ -110,6 +111,7 @@ def resolve_resume_epoch_and_offset(
             start_epoch = global_step // micro_steps_per_epoch
             batch_offset = global_step % micro_steps_per_epoch
         elif batch_offset >= micro_steps_per_epoch:
+            start_epoch += batch_offset // micro_steps_per_epoch
             batch_offset = batch_offset % micro_steps_per_epoch
 
     return start_epoch, batch_offset

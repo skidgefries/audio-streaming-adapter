@@ -22,19 +22,14 @@ def contrastive_infonce_loss(
     text_embeddings: (B, T_t, D)
     """
     b = audio_tokens.shape[0]
-    temperature = nn.Parameter(torch.tensor(temperature))
     a_pooled = audio_tokens.float().mean(dim=1)
-    t_pooled = text_embeddings.float().mean(dim=1) 
+    t_pooled = text_embeddings.float().mean(dim=1)
     a_pooled = a_pooled - a_pooled.mean(dim=0, keepdim=True)
-    t_pooled = t_pooled - t_pooled.mean(dim=0, keepdim=True)     
+    t_pooled = t_pooled - t_pooled.mean(dim=0, keepdim=True)
     a = F.normalize(a_pooled, dim=-1)
-    t = F.normalize(t_pooled, dim=-1)   
-    # a = F.normalize(audio_tokens.float().mean(dim=1), dim=-1)
-    # t = F.normalize(text_embeddings.float().mean(dim=1), dim=-1)
-    logits =  float(temperature) * (a @ t.T)
-    # loss =  F.cross_entropy(logits, torch.arange(b, device=logits.device))
-    loss = F.cross_entropy_with_logits(logits, torch.arange(b, device=logits.device))
-    
+    t = F.normalize(t_pooled, dim=-1)
+    logits = float(temperature) * (a @ t.T)
+    loss = F.cross_entropy(logits, torch.arange(b, device=logits.device))
     if return_diagnostics:
         with torch.no_grad():
             sim_matrix = a @ t.T  # (B, B) — cosine similarities

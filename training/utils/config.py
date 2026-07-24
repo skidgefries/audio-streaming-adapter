@@ -273,7 +273,7 @@ class AsrExperimentConfig:
 class Stage2Config:
     """ASR distillation."""
 
-    epochs: int = 10
+    epochs: int = 20
     lambda_align: float = 0.1
     lambda_stability: float = 0.05
     lambda_rate: float = 0.001
@@ -304,7 +304,7 @@ class Stage2Config:
             else:
                 val_max_utterances = int(val_max_raw)
         return cls(
-            epochs=env_int("EPOCHS", 10),
+            epochs=env_int("EPOCHS", 20),
             lambda_align=env_float("LAMBDA_ALIGN", 0.1),
             lambda_stability=env_float("LAMBDA_STABILITY", 0.05),
             lambda_rate=env_float("LAMBDA_RATE", 0.001),

@@ -341,11 +341,11 @@ def _compute_aux_loss_metrics(
     audio_tokens: torch.Tensor,
     gt_embeds: torch.Tensor,
     total_stability_loss: float,
-    total_sparse_loss: float,
-    total_rate_loss: float,
     total_windows: int,
+    total_sparse_loss: float = 0.0,
+    total_rate_loss: float = 0.0,
 ) -> dict[str, float]:
-    """Monitoring-only auxiliary losses (detached; not used for backprop)."""
+    """Auxiliary losses. Training may pass sparse/rate for monitoring; val uses align+stab only."""
     with torch.no_grad():
         align_loss = float(
             contrastive_infonce_loss(

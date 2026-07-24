@@ -64,6 +64,7 @@ class LibriSpeechConfig:
             parts = [p.strip() for p in env_override.split(",") if p.strip()]
             return [os.path.normpath(p) for p in parts]
         return LibriSpeechConfig.train_clean_100_and_360_roots(training_dir)
+        # return LibriSpeechConfig.train_clean_100_roots(training_dir)
 
     @staticmethod
     def dev_clean_root(training_dir: str) -> str:

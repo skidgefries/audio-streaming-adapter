@@ -1,4 +1,4 @@
-"""ASR validation: teacher-forced NLL, auxiliary losses, greedy/beam decode, WER, BLEU-4."""
+"""ASR validation: teacher-forced NLL, align/stability aux, greedy/beam decode, WER, BLEU-4."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ class UtteranceEncodeResult:
     tokens: torch.Tensor
     num_windows: int
     stability_loss: float = 0.0
+    # Optional fields kept for older encode helpers; unused by this validator.
     sparse_loss: float = 0.0
     rate_loss: float = 0.0
 
@@ -125,9 +126,9 @@ def validate_asr_only(
     maybe_autocast_fn: Callable[[torch.device], AbstractContextManager] | None = None,
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
     """
-    Run dev-clean validation: training-style losses (ASR + aux), decode, WER, BLEU-4.
+    Run dev-clean validation for ASR + align + stability training.
 
-    Losses are aggregated in batches like ``adapter_asr_only_trainer`` training steps.
+    Losses match ``adapter_asr_align_trainer`` (no rate / gate / sparse).
     WER/BLEU use per-utterance greedy/beam decode.
     """
     adapter_was_training = adapter.training
@@ -146,9 +147,6 @@ def validate_asr_only(
     m_asr = RunningMean()
     m_align = RunningMean()
     m_stab = RunningMean()
-    m_sparse = RunningMean()
-    m_rate = RunningMean()
-    m_gate = RunningMean()
     refs: list[str] = []
     hyps: list[str] = []
     items: list[dict[str, Any]] = []
@@ -171,8 +169,6 @@ def validate_asr_only(
         success_texts: list[str] = []
         total_windows = 0
         total_stability_loss = 0.0
-        total_sparse_loss = 0.0
-        total_rate_loss = 0.0
 
         for audio_path, text in zip(audio_paths, batch_texts, strict=True):
             encoded = encode_utterance_fn(
@@ -189,8 +185,6 @@ def validate_asr_only(
             success_texts.append(text)
             total_windows += encoded.num_windows
             total_stability_loss += encoded.stability_loss
-            total_sparse_loss += encoded.sparse_loss
-            total_rate_loss += encoded.rate_loss
 
         if not audio_tokens_list:
             continue
@@ -209,15 +203,10 @@ def validate_asr_only(
             audio_tokens=audio_tokens,
             gt_embeds=gt_embeds,
             total_stability_loss=total_stability_loss,
-            total_sparse_loss=total_sparse_loss,
-            total_rate_loss=total_rate_loss,
             total_windows=total_windows,
         )
         m_align.update(aux_metrics["align"])
         m_stab.update(aux_metrics["stability"])
-        m_sparse.update(aux_metrics["sparse"])
-        m_rate.update(aux_metrics["rate"])
-        m_gate.update(aux_metrics["gate"])
 
         inputs_embeds, labels, attention_mask = build_inputs_for_asr_fn(
             audio_tokens=audio_tokens,
@@ -287,9 +276,6 @@ def validate_asr_only(
                     "nll": utt_nll.item(),
                     "align": aux_metrics["align"],
                     "stability": aux_metrics["stability"],
-                    "rate": aux_metrics["rate"],
-                    "gate": aux_metrics["gate"],
-                    "sparse": aux_metrics["sparse"],
                 }
             )
             refs.append(reference)
@@ -318,9 +304,6 @@ def validate_asr_only(
         "val/asr": m_asr.mean,
         "val/align": m_align.mean,
         "val/stability": m_stab.mean,
-        "val/rate": m_rate.mean,
-        "val/gate": m_gate.mean,
-        "val/sparse_metric": m_sparse.mean,
         "val/wer": avg_wer,
         "val/bleu4": bleu4,
         "val/num_samples": float(len(items)),
@@ -328,8 +311,7 @@ def validate_asr_only(
 
     print(
         f"  [val step {global_step}] "
-        f"ASR={m_asr.mean:.4f} align={m_align.mean:.4f} stab={m_stab.mean:.4f} "
-        f"rate={m_rate.mean:.4f} gate={m_gate.mean:.4f} sparse={m_sparse.mean:.4f} | "
+        f"ASR={m_asr.mean:.4f} align={m_align.mean:.4f} stab={m_stab.mean:.4f} | "
         f"WER={avg_wer:.4f} BLEU-4={bleu4:.4f} ({len(items)} samples)",
         flush=True,
     )
@@ -341,9 +323,6 @@ def validate_asr_only(
             "val_asr": m_asr.mean,
             "val_align": m_align.mean,
             "val_stability": m_stab.mean,
-            "val_rate": m_rate.mean,
-            "val_gate": m_gate.mean,
-            "val_sparse_metric": m_sparse.mean,
             "avg_wer": avg_wer,
             "bleu4": bleu4,
             "items": items,

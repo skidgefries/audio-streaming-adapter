@@ -22,9 +22,11 @@ minimal 2 GiB spill to GPU 1 if needed). VRAM caps auto-shrink when a GPU is bus
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from contextlib import ExitStack, nullcontext
+from datetime import datetime, timezone
 
 _pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _src_root = os.path.join(_pkg_root, "src")
@@ -43,7 +45,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
 os.environ.setdefault("DEVICE", "cpu")
 os.environ.setdefault("LLM_DEVICE", "cuda:0")
 os.environ.setdefault("LLM_MAX_MEMORY", "0:14GiB,1:2GiB,cpu:64GiB")
-os.environ.setdefault("BATCH_SIZE", "2")
+os.environ.setdefault("BATCH_SIZE", "16")
 os.environ.setdefault("ASR_MICRO_BATCH_SIZE", "1")
 os.environ.setdefault("MAX_WINDOWS_PER_UTT", "32")
 os.environ.setdefault("MAX_TEXT_TOKENS", "128")
@@ -51,6 +53,9 @@ os.environ.setdefault("ENABLE_LLM_GRADIENT_CHECKPOINTING", "true")
 os.environ.setdefault("GPU_LOCK", "true")
 os.environ.setdefault("WANDB_ENABLED", "true")
 os.environ.setdefault("WANDB_RUN_NAME", "adapter_asr_align")
+os.environ.setdefault("SAVE_EVERY_STEPS", "1000")
+os.environ.setdefault("VAL_EVERY_STEPS", "1000")
+os.environ.setdefault("VAL_MAX_UTTERANCES", "100")
 
 _hf_endpoint = apply_hf_hub_endpoint(_pkg_root)
 print(f"HF Hub endpoint: {_hf_endpoint}")
@@ -109,7 +114,10 @@ from training.utils.devices import (
 )
 from training.utils.loaders import load_frozen_qwen_causal_lm
 from training.utils.logging import WandbLogger
-from training.utils.losses import contrastive_infonce_loss
+from training.utils.losses import (
+    contrastive_infonce_loss_learnable_temperature,
+    init_contrastive_logit_scale,
+)
 from training.utils.metrics import RunningMean
 from training.utils.optimization import TrainingPipeline
 
@@ -144,7 +152,9 @@ WANDB = WandbConfig.from_env()
 
 CHECKPOINT_BASENAME = env_str("CHECKPOINT_BASENAME", "adapter_asr_align") or "adapter_asr_align"
 SAVE_PATH = os.path.join(CKPT.dir, f"{CHECKPOINT_BASENAME}.pt")
-SAVE_EVERY_STEPS = CKPT.save_every_steps if CKPT.save_every_steps is not None else 500
+SAVE_EVERY_STEPS = CKPT.save_every_steps if CKPT.save_every_steps is not None else 1000
+LOG_EVERY_STEPS = max(1, DATA.batch_size)
+VAL_HISTORY_PATH = os.path.join(CKPT.dir, f"{CHECKPOINT_BASENAME}_val_history.jsonl")
 _stage1_rel = (
     env_str("STAGE1_CHECKPOINT", "checkpoints/stage1_final_checkpoint.pt")
     or "checkpoints/stage1_final_checkpoint.pt"
@@ -252,6 +262,7 @@ def _pipeline_accumulate_backward(
     *,
     no_sync_modules: tuple[torch.nn.Module, ...] | None,
     sync_grads: bool,
+    retain_graph: bool = False,
 ) -> None:
     scaled = loss / pipeline.gradient_accumulation_steps
     use_no_sync = no_sync_modules is not None and not sync_grads
@@ -260,9 +271,9 @@ def _pipeline_accumulate_backward(
             for module in no_sync_modules:
                 if isinstance(module, DDP):
                     stack.enter_context(module.no_sync())
-            scaled.backward()
+            scaled.backward(retain_graph=retain_graph)
     else:
-        scaled.backward()
+        scaled.backward(retain_graph=retain_graph)
 
 
 def _pipeline_end_microbatch(
@@ -379,21 +390,45 @@ def _encode_utterance(
     )
 
 
+def _append_val_history(
+    *,
+    history_path: str,
+    global_step: int,
+    epoch: int,
+    metrics: dict[str, float],
+    items: list[dict],
+    predictions_path: str,
+) -> None:
+    """Append full validation payload to a running JSONL history file."""
+    os.makedirs(os.path.dirname(history_path) or ".", exist_ok=True)
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "global_step": global_step,
+        "epoch": epoch + 1,
+        "predictions_path": predictions_path,
+        "metrics": metrics,
+        "num_samples": len(items),
+        "items": items,
+    }
+    with open(history_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(f"  [val step {global_step}] history -> {history_path}", flush=True)
+
+
 def _compute_val_aux_metrics(
     *,
     audio_tokens: torch.Tensor,
     gt_embeds: torch.Tensor,
     total_stability_loss: float,
     total_windows: int,
-    total_sparse_loss: float = 0.0,
-    total_rate_loss: float = 0.0,
+    logit_scale: torch.nn.Parameter,
 ) -> dict[str, float]:
     with torch.no_grad():
         align_loss = float(
-            contrastive_infonce_loss(
+            contrastive_infonce_loss_learnable_temperature(
                 audio_tokens=audio_tokens.detach().float(),
                 text_embeddings=gt_embeds.detach().float(),
-                temperature=STAGE.temperature,
+                logit_scale=logit_scale,
             ).item()
         )
     stability_loss = total_stability_loss / float(total_windows) if total_windows > 0 else 0.0
@@ -435,6 +470,7 @@ def _make_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     metrics: dict[str, float],
+    logit_scale: torch.nn.Parameter,
 ) -> TrainingCheckpoint:
     return TrainingCheckpoint(
         stage=2,
@@ -445,6 +481,7 @@ def _make_checkpoint(
         optimizer_state_dict=optimizer.state_dict(),
         scheduler_state_dict=scheduler.state_dict(),
         metrics=metrics,
+        contrastive_logit_scale=float(logit_scale.item()),
         hyperparams={
             "trainer": "adapter_asr_align_trainer",
             "stage_cfg": STAGE.__dict__,
@@ -461,6 +498,7 @@ def _maybe_save_step_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     pipeline: TrainingPipeline,
     metrics: dict[str, float],
+    logit_scale: torch.nn.Parameter,
 ) -> None:
     if SAVE_EVERY_STEPS <= 0:
         return
@@ -474,6 +512,7 @@ def _maybe_save_step_checkpoint(
         optimizer=optimizer,
         scheduler=scheduler,
         metrics=metrics,
+        logit_scale=logit_scale,
     )
     save_checkpoint(SAVE_PATH, ckpt)
     step_path = os.path.join(CKPT.dir, f"{CHECKPOINT_BASENAME}_step{step}.pt")
@@ -589,7 +628,7 @@ def train() -> None:
         p.requires_grad = False
 
     if ctx.is_main:
-        print("Loading Whisper on CPU...")
+        print(f"Loading Whisper on {train_device_str}...")
     audio = WhisperWindowFeatureExtractor(
         model_id=WHISPER_MODEL, device=train_device_str, torch_dtype=TORCH_DTYPE
     )
@@ -647,6 +686,8 @@ def train() -> None:
     if ctx.world_size > 1:
         adapter = DDP(adapter, device_ids=[ctx.local_rank])
 
+    logit_scale = init_contrastive_logit_scale(STAGE.temperature, device=train_device)
+
     if ctx.is_main:
         print(
             f"Models initialized:\n"
@@ -656,7 +697,11 @@ def train() -> None:
             f"  Checkpoint: {CHECKPOINT_BASENAME}\n"
         )
 
-    optimizer = torch.optim.AdamW(_unwrap(adapter).parameters(), lr=OPT.lr, weight_decay=OPT.weight_decay)
+    optimizer = torch.optim.AdamW(
+        [*_unwrap(adapter).parameters(), logit_scale],
+        lr=OPT.lr,
+        weight_decay=OPT.weight_decay,
+    )
     grad_accum_steps = DATA.gradient_accumulation_steps()
     effective_batch_size = DATA.batch_size * grad_accum_steps
     pipeline = TrainingPipeline(
@@ -712,6 +757,9 @@ def train() -> None:
             source=resume_path,
             is_main=ctx.is_main,
         )
+        saved_logit_scale = resume_ckpt.get("contrastive_logit_scale")
+        if saved_logit_scale is not None:
+            logit_scale.data.fill_(float(saved_logit_scale))
         if ctx.is_main:
             start_epoch, resume_batch_offset = _resume_training_state(
                 resume_ckpt=resume_ckpt,
@@ -727,16 +775,34 @@ def train() -> None:
                 f"global_step {pipeline.global_step}, "
                 f"offset {resume_batch_offset}/{len(dataloader)}\n"
             )
+    elif adapter_init_path is not None:
+        # Warm-start logit scale from Stage 1 when present.
+        init_meta = torch.load(adapter_init_path, map_location="cpu")
+        saved_logit_scale = init_meta.get("contrastive_logit_scale")
+        if saved_logit_scale is None:
+            saved_logit_scale = init_meta.get("clap_logit_scale")
+        if saved_logit_scale is not None:
+            logit_scale.data.fill_(float(saved_logit_scale))
+            if ctx.is_main:
+                print(
+                    f"  Loaded contrastive logit_scale from Stage 1 "
+                    f"(temperature={logit_scale.exp().item():.4f})"
+                )
 
     if ctx.is_main:
         print("\nStarting ASR + align + stability training")
         print(f"  Dataset: {', '.join(os.path.basename(r) for r in DATASET_ROOTS)}")
         print(f"  Epochs: {STAGE.epochs} | batch: {DATA.batch_size} | effective: {effective_batch_size}")
         print(f"  λ_align: {STAGE.lambda_align} | λ_stability: {STAGE.lambda_stability}")
-        print(f"  InfoNCE temperature: {STAGE.temperature}")
+        print(f"  InfoNCE temperature (learnable, init): {logit_scale.exp().item():.4f}")
         print(f"  Stage 1 init: {STAGE1_SAVE_PATH}")
+        print(f"  Logging: every {LOG_EVERY_STEPS} steps (batch size)")
+        if SAVE_EVERY_STEPS > 0:
+            print(f"  Checkpoints: every {SAVE_EVERY_STEPS} steps -> {SAVE_PATH}")
         if STAGE.val_enabled and os.path.isdir(VAL_ROOT):
-            print(f"  Validation: dev-clean every {STAGE.val_every_steps} steps")
+            val_cap = STAGE.val_max_utterances if STAGE.val_max_utterances is not None else "all"
+            print(f"  Validation: dev-clean every {STAGE.val_every_steps} steps (max {val_cap} utterances)")
+            print(f"  Val history: {VAL_HISTORY_PATH}")
         print(f"  LM conditioning: {TRAIN_STYLE_CONDITIONING}")
         print(f"  Stage 3 target: {DEFAULT_ASR_PROMPT[:72]}...\n")
 
@@ -787,6 +853,35 @@ def train() -> None:
             no_sync_modules = (adapter,) if ctx.world_size > 1 else None
             at_accum_boundary = pipeline.is_accumulation_boundary
 
+            # Align first on the same encode graph (retain_graph) so ASR can
+            # reuse tokens without a second Whisper+adapter pass.
+            align_loss = torch.tensor(0.0, device=train_device)
+            if use_align and n_valid >= 2:
+                align_tokens = [tokens for _path, _text, tokens, _stab, _nw in work]
+                texts_for_align = [text for _path, text, _tokens, _stab, _nw in work]
+                gt_align = llm_tokenizer(
+                    texts_for_align,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=STAGE.max_text_tokens,
+                ).to(train_device)
+                with torch.no_grad():
+                    gt_embeds = text_embedder(gt_align.input_ids.to(llm_device)).to(train_device)
+                audio_tokens = _pad_audio_tokens(align_tokens)
+                align_loss = contrastive_infonce_loss_learnable_temperature(
+                    audio_tokens=audio_tokens.float(),
+                    text_embeddings=gt_embeds.float(),
+                    logit_scale=logit_scale,
+                )
+                _pipeline_accumulate_backward(
+                    pipeline,
+                    STAGE.lambda_align * align_loss,
+                    no_sync_modules=no_sync_modules,
+                    sync_grads=False,
+                    retain_graph=True,
+                )
+
             asr_vals: list[float] = []
             stab_vals: list[float] = []
 
@@ -824,56 +919,12 @@ def train() -> None:
                     utt_loss = utt_loss + (STAGE.lambda_stability * stability_loss) / float(n_valid)
 
                 is_last_utt = utt_idx == n_valid - 1
-                sync_asr = is_last_utt and not (use_align and n_valid >= 2) and at_accum_boundary
                 _pipeline_accumulate_backward(
                     pipeline,
                     utt_loss,
                     no_sync_modules=no_sync_modules,
-                    sync_grads=sync_asr,
+                    sync_grads=is_last_utt and at_accum_boundary,
                 )
-
-                if train_device.type == "cuda":
-                    torch.cuda.empty_cache()
-
-            align_loss = torch.tensor(0.0, device=train_device)
-            if use_align and n_valid >= 2:
-                align_tokens: list[torch.Tensor] = []
-                texts_for_align: list[str] = []
-                for audio_path, text, _tokens, _stab, num_windows in work:
-                    tokens, _, _ = _forward_utterance_tokens(
-                        adapter=adapter_module,
-                        audio_extractor=audio,
-                        audio_path=audio_path,
-                        train_device=train_device,
-                        max_windows_per_utt=DATA.max_windows_per_utt,
-                    )
-                    if tokens is None or num_windows == 0:
-                        continue
-                    align_tokens.append(tokens)
-                    texts_for_align.append(text)
-
-                if len(align_tokens) >= 2:
-                    gt_align = llm_tokenizer(
-                        texts_for_align,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=STAGE.max_text_tokens,
-                    ).to(train_device)
-                    with torch.no_grad():
-                        gt_embeds = text_embedder(gt_align.input_ids.to(llm_device)).to(train_device)
-                    audio_tokens = _pad_audio_tokens(align_tokens)
-                    align_loss = contrastive_infonce_loss(
-                        audio_tokens=audio_tokens.float(),
-                        text_embeddings=gt_embeds.float(),
-                        temperature=STAGE.temperature,
-                    )
-                    _pipeline_accumulate_backward(
-                        pipeline,
-                        STAGE.lambda_align * align_loss,
-                        no_sync_modules=no_sync_modules,
-                        sync_grads=at_accum_boundary,
-                    )
 
             asr_mean = sum(asr_vals) / len(asr_vals)
             stab_mean = sum(stab_vals) / len(stab_vals) if stab_vals else 0.0
@@ -886,9 +937,10 @@ def train() -> None:
 
             optimizer_stepped = _pipeline_end_microbatch(
                 pipeline,
-                list(adapter_module.parameters()),
+                [*adapter_module.parameters(), logit_scale],
             )
 
+            temperature_val = float(logit_scale.exp().item())
             m_total.update(total_loss_val)
             m_asr.update(asr_mean)
             m_align.update(align_val)
@@ -899,22 +951,28 @@ def train() -> None:
                 accum_done = grad_accum_steps if optimizer_stepped else pipeline.accum_step
                 accum_suffix = f" | accum {accum_done}/{grad_accum_steps}"
 
-            if ctx.is_main:
-                current_lr = scheduler.get_last_lr()[0]
+            should_log = (
+                (step + 1) % LOG_EVERY_STEPS == 0
+                or (step + 1) == len(dataloader)
+            )
+            current_lr = scheduler.get_last_lr()[0]
+            if ctx.is_main and should_log:
                 print(
                     f"Micro {step:4d}/{len(dataloader)} | opt {pipeline.global_step:5d} | "
                     f"Loss: {total_loss_val:.4f} | ASR: {asr_mean:.4f} | "
                     f"Align: {align_val:.4f} | Stab: {stab_mean:.4f} | "
-                    f"LR: {current_lr:.2e}{accum_suffix}"
+                    f"Temp: {temperature_val:.4f} | LR: {current_lr:.2e}{accum_suffix}"
                 )
 
-            if ctx.is_main and optimizer_stepped:
+            if ctx.is_main and optimizer_stepped and should_log:
                 logger.log(
                     {
                         "train/loss": total_loss_val,
                         "train/asr": asr_mean,
                         "train/align": align_val,
                         "train/stability": stab_mean,
+                        "train/temperature": temperature_val,
+                        "train/logit_scale": float(logit_scale.item()),
                         "train/lr": current_lr,
                     },
                     step=pipeline.global_step,
@@ -939,7 +997,7 @@ def train() -> None:
                     repetition_penalty=STAGE.val_repetition_penalty,
                     no_repeat_ngram_size=4,
                 )
-                val_metrics, _ = validate_asr_only(
+                val_metrics, val_items = validate_asr_only(
                     adapter=adapter_module,
                     audio_extractor=audio,
                     llm_model=llm_model,
@@ -951,7 +1009,10 @@ def train() -> None:
                     ),
                     build_inputs_for_asr_fn=_build_inputs_for_asr,
                     asr_forward_loss_fn=lambda **kwargs: _asr_forward_loss(llm_model, **kwargs),
-                    compute_aux_loss_metrics_fn=_compute_val_aux_metrics,
+                    compute_aux_loss_metrics_fn=lambda **kwargs: _compute_val_aux_metrics(
+                        **kwargs,
+                        logit_scale=logit_scale,
+                    ),
                     val_root=VAL_ROOT,
                     train_device=train_device,
                     llm_device=llm_device,
@@ -967,6 +1028,23 @@ def train() -> None:
                     log_every=STAGE.val_log_every,
                     maybe_autocast_fn=_maybe_autocast,
                 )
+                temperature_val = float(logit_scale.exp().item())
+                val_metrics["val/temperature"] = temperature_val
+                val_metrics["val/logit_scale"] = float(logit_scale.item())
+                print(
+                    f"  [val step {pipeline.global_step}] "
+                    f"temperature={temperature_val:.4f} "
+                    f"logit_scale={float(logit_scale.item()):.4f}",
+                    flush=True,
+                )
+                _append_val_history(
+                    history_path=VAL_HISTORY_PATH,
+                    global_step=pipeline.global_step,
+                    epoch=epoch,
+                    metrics=val_metrics,
+                    items=val_items,
+                    predictions_path=val_predictions_path,
+                )
                 logger.log(val_metrics, step=pipeline.global_step)
 
             if ctx.is_main and optimizer_stepped:
@@ -981,7 +1059,9 @@ def train() -> None:
                         "asr": m_asr.mean,
                         "align": m_align.mean,
                         "stability": m_stab.mean,
+                        "temperature": float(logit_scale.exp().item()),
                     },
+                    logit_scale=logit_scale,
                 )
 
             if llm_device.type == "cuda":
@@ -994,6 +1074,7 @@ def train() -> None:
                 "asr": m_asr.mean,
                 "align": m_align.mean,
                 "stability": m_stab.mean,
+                "temperature": float(logit_scale.exp().item()),
             }
             ckpt = _make_checkpoint(
                 epoch=epoch + 1,
@@ -1002,6 +1083,7 @@ def train() -> None:
                 optimizer=optimizer,
                 scheduler=scheduler,
                 metrics=epoch_metrics,
+                logit_scale=logit_scale,
             )
             save_checkpoint(SAVE_PATH, ckpt)
             epoch_save_path = os.path.join(CKPT.dir, f"{CHECKPOINT_BASENAME}_epoch{epoch + 1}.pt")
