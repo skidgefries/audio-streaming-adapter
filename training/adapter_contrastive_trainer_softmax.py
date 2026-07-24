@@ -26,6 +26,13 @@ _env_path = load_project_env(_pkg_root)
 if _env_path:
     print(f"Loaded environment from {_env_path}")
 
+# Stage 1 (embeddings-only Qwen ~1.2 GiB + Whisper + adapter) fits on one 16 GiB GPU.
+# .env may set DEVICE=cpu for Stage 2; pin this trainer to the free primary GPU and
+# avoid LLM_MAX_MEMORY spill onto a contended sibling GPU.
+os.environ["DEVICE"] = "cuda:0"
+os.environ["LLM_DEVICE"] = "cuda:0"
+os.environ.pop("LLM_MAX_MEMORY", None)
+
 _hf_endpoint = apply_hf_hub_endpoint(_pkg_root)
 print(f"HF Hub endpoint: {_hf_endpoint}")
 
@@ -56,6 +63,7 @@ from training.utils.stage1_validation import validate_stage1_contrastive, wandb_
 from training.utils.devices import (
     ensure_device_ready,
     init_training_context,
+    llm_input_device,
     resolve_llm_load_plan,
 )
 
@@ -202,6 +210,8 @@ def train():
     )
     llm_tokenizer = qwen_models.tokenizer
     text_embedder = qwen_models.embedder
+    llm_embed_device = llm_input_device(text_embedder)
+    print(f"Text embedder device: {llm_embed_device}")
 
     adapter = StreamingAdapter(
         d_encoder=WHISPER_DIM,
@@ -350,10 +360,10 @@ def train():
                 padding=True,
                 truncation=True,
                 max_length=128,
-            ).to(train_device)
+            ).to(llm_embed_device)
 
             with torch.no_grad():
-                label_embeds = text_embedder(text_tokens.input_ids).float()
+                label_embeds = text_embedder(text_tokens.input_ids).float().to(train_device)
 
             if torch.isnan(label_embeds).any():
                 raise ValueError(f"label_embeds contains NaN at step {step}")
