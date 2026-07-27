@@ -20,6 +20,7 @@ sys.path.insert(0, _src_root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
+from training.utils.cuda_memory_reserve import CudaVramFence
 from training.utils.env import apply_hf_hub_endpoint, env_str, load_project_env
 
 _env_path = load_project_env(_pkg_root)
@@ -233,6 +234,11 @@ def train():
     print(f"  LLM dim: {LLM_DIM}")
     print(f"  Max tokens/window: {adapter.num_queries}\n")
 
+    # Soft VRAM fence: hold free memory between steps so neighbors cannot grab dips.
+    # Enable with CUDA_MEM_FENCE=true (optional CUDA_MEM_LEAVE_FREE_GB, default 1.5).
+    vram_fence = CudaVramFence.from_env(train_device)
+    vram_fence.acquire()
+
     dataset = LibriSpeechPairs(DATASET_ROOTS)
     dataloader = DataLoader(
         dataset,
@@ -338,6 +344,7 @@ def train():
             f"Checkpoint is at epoch {start_epoch + 1}, but only {STAGE.epochs} "
             f"epoch(s) configured. Increase STAGE.epochs to continue training."
         )
+        vram_fence.release(silent=False)
         logger.finish()
         return
 
@@ -351,6 +358,7 @@ def train():
         print(f"{'=' * 60}\n")
 
         for step, batch in enumerate(dataloader):
+            vram_fence.release()
             audio_paths, transcriptions = batch
             batch_texts = list(transcriptions)
 
@@ -505,12 +513,15 @@ def train():
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            # Re-hold leftover VRAM so other processes cannot occupy the post-step dip.
+            vram_fence.acquire()
 
         print(f"\nEpoch {epoch + 1} complete:")
         print(f"  Train Loss: {m_total.mean:.4f}")
         print(f"  Train Align: {m_align.mean:.4f}")
         print(f"  Train Stability: {m_stab.mean:.4f}\n")
 
+    vram_fence.release(silent=False)
     final_metrics: dict[str, float] = {
         "loss": m_total.mean,
         "align": m_align.mean,

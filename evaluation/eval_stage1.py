@@ -46,8 +46,9 @@ from training.utils.asr_prompt import (
     TRAIN_STYLE_CONDITIONING,
     TRAIN_STYLE_NO_IM_END_CONDITIONING,
 )
+from training.utils.asr_only_validation import decode_asr_predictions_batch
 from training.utils.checkpointing import (
-    adapt_adapter_state_dict_num_queries,
+    filter_adapter_state_dict,
     load_gate_state_dict_safe,
     resolve_gate_config_from_checkpoint,
 )
@@ -75,10 +76,51 @@ from training.utils.stage1_validation import (
 )
 
 
+def _ckpt_trainer_name(ckpt: dict) -> str | None:
+    hp = ckpt.get("hyperparams")
+    if isinstance(hp, dict):
+        trainer = hp.get("trainer")
+        return str(trainer) if trainer else None
+    return None
+
+
+def _ckpt_has_gate(ckpt: dict) -> bool:
+    return ckpt.get("gate_state_dict") is not None
+
+
+def _ckpt_has_rate_controller(ckpt: dict) -> bool:
+    """True only when weights are present (align/asr-only trainers omit RC)."""
+    sd = ckpt.get("adapter_state_dict") or {}
+    return any(str(k).startswith("rate_controller.") for k in sd)
+
+
+def _resolve_use_rate_controller(
+    ckpt: dict,
+    *,
+    stage: int,
+    stage2: Stage2Config | None,
+) -> bool:
+    """Match adapter architecture to the checkpoint (not just Stage2Config defaults)."""
+    if stage != 2:
+        return False
+    trainer = _ckpt_trainer_name(ckpt)
+    if trainer in ("adapter_asr_align_trainer", "adapter_asr_only_trainer"):
+        return False
+    if _ckpt_has_rate_controller(ckpt):
+        return True
+    if stage2 is not None:
+        return bool(stage2.use_rate_controller) and _ckpt_has_gate(ckpt)
+    return False
+
+
 def _load_adapter_state_dict(adapter: StreamingAdapter, ckpt: dict) -> None:
-    adapter.load_state_dict(
-        adapt_adapter_state_dict_num_queries(ckpt["adapter_state_dict"], adapter.num_queries)
+    state = filter_adapter_state_dict(
+        ckpt["adapter_state_dict"],
+        num_queries=adapter.num_queries,
+        use_rate_controller=bool(adapter.use_rate_controller),
     )
+    # Align/asr-only checkpoints omit rate_controller; full stage-2 may include extras.
+    adapter.load_state_dict(state, strict=False)
 
 
 def resolve_run_name(checkpoint: str, explicit_run_name: str | None = None) -> str:
@@ -272,8 +314,16 @@ def _free_cuda(*objs: object, device: torch.device | None = None) -> None:
     release_cuda_memory()
 
 
-def _build_retrieval_adapter(*, stage: int, stage2: Stage2Config | None) -> StreamingAdapter:
-    use_rc = stage == 2 and stage2 is not None and stage2.use_rate_controller
+def _build_retrieval_adapter(
+    *,
+    stage: int,
+    stage2: Stage2Config | None,
+    use_rate_controller: bool | None = None,
+) -> StreamingAdapter:
+    if use_rate_controller is None:
+        use_rc = stage == 2 and stage2 is not None and stage2.use_rate_controller
+    else:
+        use_rc = use_rate_controller
     target_rate = stage2.rate_target if stage2 is not None else 0.5
     return StreamingAdapter(
         d_encoder=WHISPER_DIM,
@@ -382,17 +432,22 @@ def _load_cosine_models(
 
     label = "Stage 2 adapter" if stage == 2 else "adapter"
     print(f"Loading {label} from checkpoint...")
-    adapter = _build_retrieval_adapter(stage=stage, stage2=stage2)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    use_rc = _resolve_use_rate_controller(ckpt, stage=stage, stage2=stage2)
+    adapter = _build_retrieval_adapter(
+        stage=stage, stage2=stage2, use_rate_controller=use_rc
+    )
     adapter = adapter.to(device, dtype=torch_dtype)
 
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     _load_adapter_state_dict(adapter, ckpt)
     adapter.eval()
     extra = ""
     if stage == 2 and stage2 is not None:
+        trainer = _ckpt_trainer_name(ckpt)
         extra = (
-            f" rate_controller={stage2.use_rate_controller} "
+            f" rate_controller={use_rc} "
             f"target_rate={stage2.rate_target}"
+            + (f" trainer={trainer}" if trainer else "")
         )
     print(
         f"  Loaded {checkpoint_path}\n"
@@ -577,19 +632,25 @@ def _load_nll_audio_encoder_and_adapter(
 
     label = "Stage 2 adapter" if stage == 2 else "adapter"
     print(f"Loading {label} from checkpoint...")
-    adapter = _build_retrieval_adapter(stage=stage, stage2=stage2)
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    use_rc = _resolve_use_rate_controller(ckpt, stage=stage, stage2=stage2)
+    adapter = _build_retrieval_adapter(
+        stage=stage, stage2=stage2, use_rate_controller=use_rc
+    )
     adapter = adapter.to(device, dtype=torch_dtype)
 
-    ckpt = torch.load(checkpoint_path, map_location=device)
     _load_adapter_state_dict(adapter, ckpt)
     adapter.eval()
     _assert_module_device(audio.whisper, device, "Whisper")
     _assert_module_device(adapter, device, "Adapter")
     extra = ""
     if stage == 2 and stage2 is not None:
+        trainer = _ckpt_trainer_name(ckpt)
         extra = (
-            f" rate_controller={stage2.use_rate_controller} "
-            f"target_rate={stage2.rate_target}\n"
+            f" rate_controller={use_rc} "
+            f"target_rate={stage2.rate_target}"
+            + (f" trainer={trainer}" if trainer else "")
+            + "\n"
         )
     print(
         f"  Loaded {checkpoint_path}\n"
@@ -1146,8 +1207,16 @@ def _build_stage2_gate_from_checkpoint(
     return gate, ckpt
 
 
-def _build_asr_adapter(*, stage: int, stage2: Stage2Config) -> StreamingAdapter:
-    use_rc = stage == 2 and stage2.use_rate_controller
+def _build_asr_adapter(
+    *,
+    stage: int,
+    stage2: Stage2Config,
+    use_rate_controller: bool | None = None,
+) -> StreamingAdapter:
+    if use_rate_controller is None:
+        use_rc = stage == 2 and stage2.use_rate_controller
+    else:
+        use_rc = use_rate_controller
     return StreamingAdapter(
         d_encoder=768,
         d_llm=4096,
@@ -1179,6 +1248,9 @@ def _load_asr_checkpoint_into_models(
         "stage": stage,
         "epoch": ckpt.get("epoch"),
         "global_step": ckpt.get("global_step"),
+        "trainer": _ckpt_trainer_name(ckpt),
+        "use_rate_controller": bool(adapter.use_rate_controller),
+        "has_gate": gate is not None,
     }
     if stage == 2 and gate is not None:
         if "gate_state_dict" not in ckpt:
@@ -1225,37 +1297,42 @@ def _build_asr_pipeline(
         stride_seconds=0.4,
     )
 
-    adapter = _build_asr_adapter(stage=stage, stage2=stage2).to(device, dtype=torch_dtype)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    use_rc = _resolve_use_rate_controller(ckpt, stage=stage, stage2=stage2)
+    use_gate = stage == 2 and _ckpt_has_gate(ckpt)
+    trainer = _ckpt_trainer_name(ckpt)
+
+    adapter = _build_asr_adapter(
+        stage=stage, stage2=stage2, use_rate_controller=use_rc
+    ).to(device, dtype=torch_dtype)
+    _load_adapter_state_dict(adapter, ckpt)
+    adapter.eval()
+
     gate: TurnEndCommitGate | None = None
-    if stage == 2:
-        gate, ckpt = _build_stage2_gate_from_checkpoint(
+    if use_gate:
+        gate, _ = _build_stage2_gate_from_checkpoint(
             checkpoint_path,
             device=device,
             torch_dtype=torch_dtype,
         )
-        _load_adapter_state_dict(adapter, ckpt)
-        if "gate_state_dict" not in ckpt:
-            raise KeyError(
-                f"Stage 2 checkpoint missing gate_state_dict: {checkpoint_path}. "
-                "Use stage 1 eval for checkpoints without a gate."
-            )
         load_gate_state_dict_safe(gate, ckpt)
-        adapter.eval()
         gate.eval()
-        ckpt_meta = {
-            "checkpoint": checkpoint_path,
-            "stage": stage,
-            "epoch": ckpt.get("epoch"),
-            "global_step": ckpt.get("global_step"),
-        }
-    else:
-        ckpt_meta = _load_asr_checkpoint_into_models(
-            checkpoint_path,
-            stage=stage,
-            adapter=adapter,
-            gate=gate,
-            device=device,
+    elif stage == 2:
+        print(
+            "  Stage-2 checkpoint has no gate_state_dict "
+            f"(trainer={trainer or 'unknown'}); "
+            "evaluating with WhisperAdapterLLMPipeline (asr-align / asr-only style)."
         )
+
+    ckpt_meta = {
+        "checkpoint": checkpoint_path,
+        "stage": stage,
+        "epoch": ckpt.get("epoch"),
+        "global_step": ckpt.get("global_step"),
+        "trainer": trainer,
+        "use_rate_controller": use_rc,
+        "has_gate": use_gate,
+    }
 
     base_kwargs = dict(
         whisper_processor=whisper.processor,
@@ -1268,7 +1345,7 @@ def _build_asr_pipeline(
         torch_dtype=torch_dtype,
     )
 
-    if stage == 2:
+    if use_gate:
         assert gate is not None
         pipeline = WhisperAdapterLLMCommitGatePipeline(
             early_commit_gate=gate,
@@ -1280,6 +1357,64 @@ def _build_asr_pipeline(
     return pipeline, ckpt_meta
 
 
+def _encode_asr_tokens_for_eval(
+    pipeline: WhisperAdapterLLMPipeline | WhisperAdapterLLMCommitGatePipeline,
+    wave: torch.Tensor,
+    *,
+    n_windows: int,
+    use_early_commit_truncation: bool,
+) -> tuple[torch.Tensor, int]:
+    """Encode one waveform to compressed adapter tokens (no LLM decode)."""
+    if isinstance(pipeline, WhisperAdapterLLMCommitGatePipeline):
+        enc, windows, _ = pipeline.encode_waveform(wave)
+        _ = enc
+        window_list = WhisperAdapterLLMPipeline._select_windows(windows, n_windows)
+        adapter = pipeline._llm.streaming_adapter
+        gate = pipeline.early_commit_gate
+        adapter.reset_streaming_state()
+        silence_tracker = (
+            gate.make_silence_tracker() if gate.silence_mode in ("rule", "both") else None
+        )
+        learned_silence_tracker = (
+            gate.make_learned_silence_tracker()
+            if gate.silence_mode in ("learned", "both")
+            else None
+        )
+        chunks: list[torch.Tensor] = []
+        with torch.no_grad():
+            for t, w in enumerate(window_list):
+                wdev = w.to(device=pipeline._llm.device, dtype=pipeline._llm.torch_dtype)
+                step = adapter.forward_window(wdev)
+                chunks.append(step["tokens"])
+                accumulated = torch.cat(chunks, dim=1)
+                gr = gate(
+                    accumulated,
+                    t,
+                    len(window_list),
+                    endpoint_label=None,
+                    silence_tracker=silence_tracker,
+                    learned_silence_tracker=learned_silence_tracker,
+                    window_tokens=step["tokens"],
+                )
+                if (
+                    use_early_commit_truncation
+                    and t < len(window_list) - 1
+                    and gr["should_commit"].item() > 0.5
+                ):
+                    break
+        if not chunks:
+            raise RuntimeError("Commit-gate encode produced no audio tokens")
+        tokens = torch.cat(chunks, dim=1)
+        return tokens, len(chunks)
+
+    _, windows, _ = pipeline.encode_waveform(wave)
+    window_list = pipeline._select_windows(windows, n_windows)
+    with torch.no_grad():
+        adapter_out = pipeline.streaming_adapter(window_list)
+    tokens = adapter_out["tokens"]
+    return tokens, len(window_list)
+
+
 @torch.no_grad()
 def _run_asr_eval(
     pipeline: WhisperAdapterLLMPipeline | WhisperAdapterLLMCommitGatePipeline,
@@ -1289,6 +1424,7 @@ def _run_asr_eval(
     n_windows: int,
     generation: LlmGenerationParams,
     log_every: int,
+    batch_size: int = 16,
     use_early_commit_truncation: bool = False,
     train_style_asr: bool = True,
     append_im_end: bool = True,
@@ -1298,11 +1434,16 @@ def _run_asr_eval(
     hyps: list[str] = []
     items: list[dict[str, Any]] = []
 
+    batch_size = max(1, int(batch_size))
+    # Prompt-ASR prefixes differ per length/template; keep sequential generate there.
+    use_batched_decode = train_style_asr and batch_size > 1
+
     n_win_msg = "all windows" if n_windows == -1 else f"{n_windows} window(s)"
     rep_pen = generation.repetition_penalty
     print(
         f"Generating transcripts for {len(pairs)} utterances "
-        f"({n_win_msg}, beams={generation.num_beams}, "
+        f"(batch_size={batch_size if use_batched_decode else 1}, {n_win_msg}, "
+        f"beams={generation.num_beams}, "
         f"max_new_tokens={generation.max_new_tokens}, "
         f"repetition_penalty={rep_pen})...",
         flush=True,
@@ -1321,62 +1462,132 @@ def _run_asr_eval(
     if n_windows == -1:
         print(
             "  Note: n_windows=-1 uses every adapter window per utterance; "
-            "the first sample can take several minutes.",
+            "the first batch can take several minutes.",
             flush=True,
         )
 
-    for i, (audio_path, reference) in enumerate(pairs):
-        if i == 0:
-            print(f"  Starting utterance 1/{len(pairs)}...", flush=True)
-        wave = load_mono_waveform_16k(audio_path)
-        t0 = time.time()
-        gen_kwargs = dict(
-            n_windows=n_windows,
-            prompt=asr_prompt,
-            generation=generation,
-            train_style_asr=train_style_asr,
-            append_im_end=append_im_end,
-        )
-        if isinstance(pipeline, WhisperAdapterLLMCommitGatePipeline):
-            result = pipeline.generate(
-                wave,
-                use_early_commit_truncation=use_early_commit_truncation,
-                **gen_kwargs,
-            )
-        else:
-            result = pipeline.generate(wave, **gen_kwargs)
-        elapsed = time.time() - t0
+    llm_pipeline = (
+        pipeline._llm if isinstance(pipeline, WhisperAdapterLLMCommitGatePipeline) else pipeline
+    )
 
-        
-
-        ref = _normalize_text(reference)
-        hyp = _normalize_text(result["text"])
-        w = _wer(ref, hyp)
-        b = _bleu4(ref, hyp)
-
-        items.append(
-            {
-                "utterance_id": _utterance_id(audio_path),
-                "audio_path": audio_path,
-                "reference": ref,
-                "prediction": hyp,
-                "wer": w,
-                "bleu4": b,
-                "latency_s": elapsed,
-                "num_windows_used": result.get("num_windows_used"),
-            }
-        )
-        refs.append(ref)
-        hyps.append(hyp)
-
-        if log_every > 0 and (
-            i == 0 or (i + 1) % log_every == 0 or i + 1 == len(pairs)
-        ):
+    for i0 in range(0, len(pairs), batch_size if use_batched_decode else 1):
+        batch_pairs = pairs[i0 : i0 + (batch_size if use_batched_decode else 1)]
+        if i0 == 0:
             print(
-                f"  [{i + 1}/{len(pairs)}] WER={w:.3f} BLEU-4={b:.3f} "
-                f"windows={result.get('num_windows_used')} ({elapsed:.1f}s)",
+                f"  Starting utterances {i0 + 1}-{i0 + len(batch_pairs)}/{len(pairs)}...",
                 flush=True,
             )
+
+        if not use_batched_decode:
+            audio_path, reference = batch_pairs[0]
+            wave = load_mono_waveform_16k(audio_path)
+            t0 = time.time()
+            gen_kwargs = dict(
+                n_windows=n_windows,
+                prompt=asr_prompt,
+                generation=generation,
+                train_style_asr=train_style_asr,
+                append_im_end=append_im_end,
+            )
+            if isinstance(pipeline, WhisperAdapterLLMCommitGatePipeline):
+                result = pipeline.generate(
+                    wave,
+                    use_early_commit_truncation=use_early_commit_truncation,
+                    **gen_kwargs,
+                )
+            else:
+                result = pipeline.generate(wave, **gen_kwargs)
+            elapsed = time.time() - t0
+            ref = _normalize_text(reference)
+            hyp = _normalize_text(result["text"])
+            w = _wer(ref, hyp)
+            b = _bleu4(ref, hyp)
+            items.append(
+                {
+                    "utterance_id": _utterance_id(audio_path),
+                    "audio_path": audio_path,
+                    "reference": ref,
+                    "prediction": hyp,
+                    "wer": w,
+                    "bleu4": b,
+                    "latency_s": elapsed,
+                    "num_windows_used": result.get("num_windows_used"),
+                }
+            )
+            refs.append(ref)
+            hyps.append(hyp)
+            i = i0
+            if log_every > 0 and (
+                i == 0 or (i + 1) % log_every == 0 or i + 1 == len(pairs)
+            ):
+                print(
+                    f"  [{i + 1}/{len(pairs)}] WER={w:.3f} BLEU-4={b:.3f} "
+                    f"windows={result.get('num_windows_used')} ({elapsed:.1f}s)",
+                    flush=True,
+                )
+            continue
+
+        t0 = time.time()
+        tokens_list: list[torch.Tensor] = []
+        windows_used: list[int] = []
+        paths: list[str] = []
+        references: list[str] = []
+        for audio_path, reference in batch_pairs:
+            wave = load_mono_waveform_16k(audio_path)
+            tokens, n_used = _encode_asr_tokens_for_eval(
+                pipeline,
+                wave,
+                n_windows=n_windows,
+                use_early_commit_truncation=use_early_commit_truncation,
+            )
+            tokens_list.append(tokens)
+            windows_used.append(n_used)
+            paths.append(audio_path)
+            references.append(reference)
+
+        predictions = decode_asr_predictions_batch(
+            llm_model=llm_pipeline.llm_model,
+            llm_tokenizer=llm_pipeline.llm_tokenizer,
+            audio_tokens_list=tokens_list,
+            llm_device=llm_pipeline._llm_tensor_device(),
+            torch_dtype=llm_pipeline.torch_dtype,
+            generation=generation,
+            append_im_end=append_im_end,
+            trim_asr_tail=train_style_asr,
+        )
+        elapsed = time.time() - t0
+        per_utt = elapsed / max(len(batch_pairs), 1)
+
+        for j, (audio_path, reference, hyp_raw, n_used) in enumerate(
+            zip(paths, references, predictions, windows_used, strict=True)
+        ):
+            ref = _normalize_text(reference)
+            hyp = _normalize_text(hyp_raw)
+            w = _wer(ref, hyp)
+            b = _bleu4(ref, hyp)
+            idx = i0 + j
+            items.append(
+                {
+                    "utterance_id": _utterance_id(audio_path),
+                    "audio_path": audio_path,
+                    "reference": ref,
+                    "prediction": hyp,
+                    "wer": w,
+                    "bleu4": b,
+                    "latency_s": per_utt,
+                    "num_windows_used": n_used,
+                }
+            )
+            refs.append(ref)
+            hyps.append(hyp)
+            if log_every > 0 and (
+                idx == 0 or (idx + 1) % log_every == 0 or idx + 1 == len(pairs)
+            ):
+                print(
+                    f"  [{idx + 1}/{len(pairs)}] WER={w:.3f} BLEU-4={b:.3f} "
+                    f"windows={n_used} (~{per_utt:.1f}s/utt, batch={len(batch_pairs)})",
+                    flush=True,
+                )
 
     avg_wer = sum(p["wer"] for p in items) / max(len(items), 1)
     bleu = _corpus_bleu4(refs, hyps)
@@ -1420,6 +1631,7 @@ def _evaluate_asr_one_variant(
     stage2: Stage2Config,
     llm_device_map: str | None,
     log_every: int,
+    batch_size: int,
     use_early_commit_truncation: bool,
     prompt_asr: bool,
     append_im_end: bool,
@@ -1447,7 +1659,11 @@ def _evaluate_asr_one_variant(
         f"step={ckpt_meta.get('global_step')}\n"
     )
 
-    early_trunc = stage == 2 and use_early_commit_truncation
+    early_trunc = (
+        stage == 2
+        and use_early_commit_truncation
+        and bool(ckpt_meta.get("has_gate"))
+    )
     train_style_asr, conditioning = _resolve_lm_conditioning(
         stage=stage, prompt_asr=prompt_asr, append_im_end=append_im_end
     )
@@ -1459,6 +1675,7 @@ def _evaluate_asr_one_variant(
         n_windows=n_windows,
         generation=generation,
         log_every=log_every,
+        batch_size=batch_size,
         use_early_commit_truncation=early_trunc,
         train_style_asr=train_style_asr,
         append_im_end=append_im_end,
@@ -1484,6 +1701,7 @@ def _evaluate_asr_one_variant(
                 "conditioning": conditioning,
                 "train_style_asr": train_style_asr,
                 "append_im_end": append_im_end,
+                "batch_size": batch_size,
                 "device": device,
             },
         },
@@ -1563,6 +1781,7 @@ def run_asr(*, stage: int, args: argparse.Namespace) -> None:
             llm_device_map=llm_map,
             llm_max_memory=llm_max_memory,
             log_every=args.log_every,
+            batch_size=args.batch_size,
             use_early_commit_truncation=args.early_commit_truncation,
             prompt_asr=args.prompt_asr,
             append_im_end=append_im_end,
@@ -1617,6 +1836,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--early-commit-truncation", action="store_true", default=False)
     ap.add_argument("--llm-device-map", type=str, default="auto")
     ap.add_argument("--log-every", type=int, default=5)
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=env_int("VAL_BATCH_SIZE", 16),
+        help="ASR decode batch size for train-style eval (default: VAL_BATCH_SIZE or 16)",
+    )
     im_end = ap.add_mutually_exclusive_group()
     im_end.add_argument("--append-im-end", dest="append_im_end", action="store_true", default=True)
     im_end.add_argument("--no-append-im-end", dest="append_im_end", action="store_false")

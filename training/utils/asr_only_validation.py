@@ -51,6 +51,119 @@ def _pad_audio_tokens(utterances: list[torch.Tensor]) -> torch.Tensor:
     return torch.cat(padded, dim=0)
 
 
+def _train_style_prefix_embeds_one(
+    *,
+    llm_model: torch.nn.Module,
+    llm_tokenizer,
+    audio_tokens: torch.Tensor,
+    llm_device: torch.device,
+    torch_dtype: torch.dtype,
+    append_im_end: bool,
+) -> torch.Tensor:
+    """Build ``[audio]`` or ``[audio | im_end/BOS | no_think]`` embeds for one utterance."""
+    audio = audio_tokens.to(device=llm_device, dtype=torch_dtype)
+    if audio.ndim != 3 or audio.shape[0] != 1:
+        raise ValueError(f"Expected audio_tokens shape (1, T, D), got {tuple(audio.shape)}")
+    if not append_im_end:
+        return audio
+    sep_id = WhisperAdapterLLMPipeline.train_style_separator_token_id(llm_tokenizer)
+    sep_ids = torch.tensor([[sep_id]], device=llm_device, dtype=torch.long)
+    sep_embed = llm_model.get_input_embeddings()(sep_ids)
+    no_think_embed = WhisperAdapterLLMPipeline.qwen_no_think_suffix_embeds(
+        llm_model, llm_device, torch_dtype
+    )
+    return torch.cat([audio, sep_embed, no_think_embed], dim=1)
+
+
+def _left_pad_embeds(embeds_list: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Left-pad variable-length ``(1, T, D)`` embeds to ``(B, T_max, D)`` + attention mask."""
+    if not embeds_list:
+        raise ValueError("embeds_list must be non-empty")
+    max_t = max(int(e.shape[1]) for e in embeds_list)
+    dim = int(embeds_list[0].shape[2])
+    device = embeds_list[0].device
+    dtype = embeds_list[0].dtype
+    batch = len(embeds_list)
+    out = torch.zeros(batch, max_t, dim, device=device, dtype=dtype)
+    mask = torch.zeros(batch, max_t, dtype=torch.long, device=device)
+    for i, emb in enumerate(embeds_list):
+        t = int(emb.shape[1])
+        out[i, max_t - t :] = emb[0]
+        mask[i, max_t - t :] = 1
+    return out, mask
+
+
+@torch.no_grad()
+def decode_asr_predictions_batch(
+    *,
+    llm_model: torch.nn.Module,
+    llm_tokenizer,
+    audio_tokens_list: list[torch.Tensor],
+    llm_device: torch.device,
+    torch_dtype: torch.dtype,
+    generation: LlmGenerationParams,
+    append_im_end: bool = True,
+    trim_asr_tail: bool = False,
+    maybe_autocast_fn: Callable[[torch.device], AbstractContextManager] | None = None,
+) -> list[str]:
+    """
+    Batched greedy/beam decode from compressed audio tokens (train-style prefix).
+
+    Each entry in ``audio_tokens_list`` is ``(1, T_i, D)``. Prefixes are left-padded so
+    HuggingFace ``generate`` can run as one batch.
+    """
+    if not audio_tokens_list:
+        return []
+    if len(audio_tokens_list) == 1:
+        return [
+            decode_asr_prediction(
+                llm_model=llm_model,
+                llm_tokenizer=llm_tokenizer,
+                audio_tokens=audio_tokens_list[0],
+                llm_device=llm_device,
+                torch_dtype=torch_dtype,
+                generation=generation,
+                append_im_end=append_im_end,
+                trim_asr_tail=trim_asr_tail,
+                maybe_autocast_fn=maybe_autocast_fn,
+            )
+        ]
+
+    embeds_list = [
+        _train_style_prefix_embeds_one(
+            llm_model=llm_model,
+            llm_tokenizer=llm_tokenizer,
+            audio_tokens=tokens,
+            llm_device=llm_device,
+            torch_dtype=torch_dtype,
+            append_im_end=append_im_end,
+        )
+        for tokens in audio_tokens_list
+    ]
+    input_embeds, attention_mask = _left_pad_embeds(embeds_list)
+    gen_cfg = build_hf_generation_config(
+        model=llm_model,
+        tokenizer=llm_tokenizer,
+        params=generation,
+    )
+    autocast = maybe_autocast_fn(llm_device) if maybe_autocast_fn else nullcontext()
+    with autocast:
+        out_ids = llm_model.generate(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            generation_config=gen_cfg,
+        )
+    texts: list[str] = []
+    for row in out_ids:
+        text = llm_tokenizer.decode(row, skip_special_tokens=True).strip()
+        if trim_asr_tail:
+            from adapter_llm_pipeline import _truncate_asr_chat_tail
+
+            text = _truncate_asr_chat_tail(text)
+        texts.append(text)
+    return texts
+
+
 @torch.no_grad()
 def decode_asr_prediction(
     *,
@@ -61,22 +174,18 @@ def decode_asr_prediction(
     torch_dtype: torch.dtype,
     generation: LlmGenerationParams,
     append_im_end: bool = True,
+    trim_asr_tail: bool = False,
     maybe_autocast_fn: Callable[[torch.device], AbstractContextManager] | None = None,
 ) -> str:
     """Greedy/beam decode from compressed audio tokens (train-style prefix)."""
-    llm_dev = llm_device
-    audio = audio_tokens.to(device=llm_dev, dtype=torch_dtype)
-    if append_im_end:
-        sep_id = WhisperAdapterLLMPipeline.train_style_separator_token_id(llm_tokenizer)
-        sep_ids = torch.tensor([[sep_id]], device=llm_dev, dtype=torch.long)
-        sep_embed = llm_model.get_input_embeddings()(sep_ids)
-        no_think_embed = WhisperAdapterLLMPipeline.qwen_no_think_suffix_embeds(
-            llm_model, llm_dev, torch_dtype
-        )
-        input_embeds = torch.cat([audio, sep_embed, no_think_embed], dim=1)
-    else:
-        input_embeds = audio
-
+    input_embeds = _train_style_prefix_embeds_one(
+        llm_model=llm_model,
+        llm_tokenizer=llm_tokenizer,
+        audio_tokens=audio_tokens,
+        llm_device=llm_device,
+        torch_dtype=torch_dtype,
+        append_im_end=append_im_end,
+    )
     attention_mask = torch.ones(
         input_embeds.shape[0],
         input_embeds.shape[1],
@@ -95,7 +204,12 @@ def decode_asr_prediction(
             attention_mask=attention_mask,
             generation_config=gen_cfg,
         )
-    return llm_tokenizer.decode(out_ids[0], skip_special_tokens=True).strip()
+    text = llm_tokenizer.decode(out_ids[0], skip_special_tokens=True).strip()
+    if trim_asr_tail:
+        from adapter_llm_pipeline import _truncate_asr_chat_tail
+
+        text = _truncate_asr_chat_tail(text)
+    return text
 
 
 @torch.no_grad()
@@ -228,8 +342,9 @@ def validate_asr_only(
         if batch_idx % 20 == 0 and batch_idx > 0:
             print(f"    val batch {batch_idx}/{len(val_loader)}", flush=True)
 
-        for audio_path, text, tokens in zip(success_paths, success_texts, audio_tokens_list, strict=True):
-            reference = normalize_asr_text(text)
+        # Per-utterance NLL (diagnostics) still sequential; WER decode is batched.
+        utt_nlls: list[float] = []
+        for text, tokens in zip(success_texts, audio_tokens_list, strict=True):
             gt_single = llm_tokenizer(
                 [text],
                 return_tensors="pt",
@@ -252,17 +367,23 @@ def validate_asr_only(
                 micro_batch_size=1,
                 device=llm_device,
             )
+            utt_nlls.append(float(utt_nll.item()))
 
-            prediction = decode_asr_prediction(
-                llm_model=llm_model,
-                llm_tokenizer=llm_tokenizer,
-                audio_tokens=tokens,
-                llm_device=llm_device,
-                torch_dtype=tokens.dtype,
-                generation=generation,
-                append_im_end=True,
-                maybe_autocast_fn=maybe_autocast_fn,
-            )
+        predictions = decode_asr_predictions_batch(
+            llm_model=llm_model,
+            llm_tokenizer=llm_tokenizer,
+            audio_tokens_list=audio_tokens_list,
+            llm_device=llm_device,
+            torch_dtype=audio_tokens_list[0].dtype,
+            generation=generation,
+            append_im_end=True,
+            maybe_autocast_fn=maybe_autocast_fn,
+        )
+
+        for audio_path, text, prediction, utt_nll in zip(
+            success_paths, success_texts, predictions, utt_nlls, strict=True
+        ):
+            reference = normalize_asr_text(text)
             prediction = normalize_asr_text(prediction)
             wer = word_error_rate(reference, prediction)
 
@@ -273,7 +394,7 @@ def validate_asr_only(
                     "reference": reference,
                     "prediction": prediction,
                     "wer": wer,
-                    "nll": utt_nll.item(),
+                    "nll": utt_nll,
                     "align": aux_metrics["align"],
                     "stability": aux_metrics["stability"],
                 }
@@ -286,7 +407,7 @@ def validate_asr_only(
                 samples_done == 1 or samples_done % log_every == 0 or samples_done == n_val
             ):
                 print(
-                    f"  [{samples_done}/{n_val}] WER={wer:.3f} NLL={utt_nll.item():.4f} "
+                    f"  [{samples_done}/{n_val}] WER={wer:.3f} NLL={utt_nll:.4f} "
                     f"align={aux_metrics['align']:.4f} stab={aux_metrics['stability']:.4f} "
                     f"ref={reference[:48]}{'...' if len(reference) > 48 else ''}",
                     flush=True,

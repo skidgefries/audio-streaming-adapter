@@ -2,7 +2,9 @@
 Stage 2 evaluation on LibriSpeech test-clean.
 
 Evaluates checkpoints from ``training/adapter_asr_trainer.py`` (StreamingAdapter +
-TurnEndCommitGate, optional rate controller).
+TurnEndCommitGate, optional rate controller) and from
+``training/adapter_asr_align_trainer.py`` / ``adapter_asr_only_trainer.py``
+(adapter only — no gate / rate controller; uses ``WhisperAdapterLLMPipeline``).
 
 Choose what to run with ``--metric``:
 
@@ -83,6 +85,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--early-commit-truncation", action="store_true", default=False)
     ap.add_argument("--llm-device-map", type=str, default="auto")
     ap.add_argument("--log-every", type=int, default=stage2.val_log_every)
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=env_int("VAL_BATCH_SIZE", 16),
+        help="ASR decode batch size for train-style eval (default: VAL_BATCH_SIZE or 16)",
+    )
     im_end = ap.add_mutually_exclusive_group()
     im_end.add_argument("--append-im-end", dest="append_im_end", action="store_true", default=True)
     im_end.add_argument("--no-append-im-end", dest="append_im_end", action="store_false")
