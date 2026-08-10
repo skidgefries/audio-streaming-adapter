@@ -85,7 +85,7 @@ def contrastive_infonce_loss_learnable_temperature(
     # t_pooled = torch.cat([t_pooled_mean, t_pooled_std], dim=-1)
     a = F.normalize(a_pooled, dim=-1)
     t = F.normalize(t_pooled, dim=-1)
-    scale = logit_scale.exp().clamp(max=100)
+    scale = logit_scale.exp()
     logits = scale * (a @ t.T)
     # loss = F.cross_entropy(logits, torch.arange(b, device=logits.device))
     loss = F.cross_entropy(logits, torch.arange(b, device=logits.device))
@@ -150,7 +150,7 @@ def clap_loss_learnable_temperature(
     t_pooled = t_pooled.to(loss_device)
 
     n = a_pooled.shape[0]
-    scale = logit_scale.exp().clamp(max=100)
+    scale = logit_scale.exp()
     c = scale * (t_pooled @ a_pooled.T)
     labels = torch.arange(n, device=c.device)
     loss = 0.5 * (F.cross_entropy(c, labels) + F.cross_entropy(c.T, labels))
@@ -284,7 +284,7 @@ def sigmoid_loss_learnable_temperature(
     a = F.normalize(a_pooled, dim=-1)
     t = F.normalize(t_pooled, dim=-1)
 
-    scale = logit_scale.exp().clamp(max=100)
+    scale = logit_scale.exp()
     logits = scale * (a @ t.T)
     if logit_bias is not None:
         logits = logits + logit_bias
