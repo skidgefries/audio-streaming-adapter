@@ -2,11 +2,19 @@
 Stage 1 Training: Audio-Text Alignment (Softmax InfoNCE)
 
 Trains the streaming adapter using softmax InfoNCE contrastive learning to align
-audio tokens with text embeddings from the frozen LLM.
+audio tokens with text embeddings from a frozen LLM (Qwen or Vicuna).
 
 Loss: L = L_align (InfoNCE) + λ_stability · L_stability
+
+Examples::
+
+    uv run training/adapter_contrastive_trainer_softmax.py --llm qwen
+    uv run training/adapter_contrastive_trainer_softmax.py --llm vicuna
+    uv run training/adapter_contrastive_trainer_softmax.py --llm vicuna \\
+        --llm-model-id lmsys/vicuna-7b-v1.5
 """
 
+import argparse
 import os
 import sys
 from contextlib import nullcontext
@@ -20,14 +28,55 @@ sys.path.insert(0, _src_root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, _pkg_root)
 
-from training.utils.cuda_memory_reserve import CudaVramFence
+try:
+    from training.utils.cuda_memory_reserve import CudaVramFence
+except ModuleNotFoundError:
+    class CudaVramFence:  # noqa: D106 — optional soft VRAM fence
+        """No-op when ``training.utils.cuda_memory_reserve`` is not installed."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        @classmethod
+        def from_env(cls, device) -> "CudaVramFence":
+            return cls()
+
+        def acquire(self) -> int:
+            return 0
+
+        def release(self, *, silent: bool = True) -> None:
+            pass
+
 from training.utils.env import apply_hf_hub_endpoint, env_str, load_project_env
 
 _env_path = load_project_env(_pkg_root)
 if _env_path:
     print(f"Loaded environment from {_env_path}")
 
-# Stage 1 (embeddings-only Qwen ~1.2 GiB + Whisper + adapter) fits on one 16 GiB GPU.
+
+def _parse_cli(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "--llm",
+        choices=["qwen", "vicuna"],
+        default=None,
+        help="Frozen LLM for text embeddings (default: env LLM_CHOICE or qwen)",
+    )
+    ap.add_argument(
+        "--llm-model-id",
+        default=None,
+        help="Optional HF hub id / local path override for the chosen LLM "
+        "(default: preset id, or env LLM_MODEL_ID)",
+    )
+    return ap.parse_args(argv)
+
+
+_CLI = _parse_cli()
+
+# Stage 1 (embeddings-only LLM ~1–2 GiB + Whisper + adapter) fits on one 16 GiB GPU.
 # .env may set DEVICE=cpu for Stage 2; pin this trainer to the free primary GPU and
 # avoid LLM_MAX_MEMORY spill onto a contended sibling GPU.
 os.environ["DEVICE"] = "cuda:0"
@@ -48,9 +97,11 @@ from training.utils.checkpointing import TrainingCheckpoint, save_checkpoint
 from training.utils.config import (
     CheckpointConfig,
     DataConfig,
+    DeviceConfig,
+    LLM_CHOICES,
+    LlmChoice,
     OptimConfig,
     Stage1Config,
-    DeviceConfig,
     WandbConfig,
 )
 from training.utils.logging import WandbLogger
@@ -59,7 +110,7 @@ from training.utils.losses import (
     init_contrastive_logit_scale,
 )
 from training.utils.metrics import RunningMean
-from training.utils.loaders import load_frozen_qwen_embeddings
+from training.utils.loaders import load_frozen_llm_embeddings
 from training.utils.stage1_validation import validate_stage1_contrastive, wandb_val_log_dict
 from training.utils.devices import (
     ensure_device_ready,
@@ -72,6 +123,22 @@ DEVICE_CFG = DeviceConfig.from_env()
 TORCH_DTYPE = torch.float32 if DEVICE_CFG.device == "cpu" or not torch.cuda.is_available() else torch.bfloat16
 
 
+def _resolve_llm_choice() -> LlmChoice:
+    if _CLI.llm is not None:
+        # CLI --llm wins; --llm-model-id overrides the preset hub id only.
+        return LlmChoice.from_name(_CLI.llm, model_id_override=_CLI.llm_model_id)
+    if _CLI.llm_model_id is not None:
+        # Infer preset from model id when possible; else treat as custom override.
+        for name in LLM_CHOICES:
+            if _CLI.llm_model_id == LlmChoice.from_name(name).model_id:
+                return LlmChoice.from_name(name, model_id_override=_CLI.llm_model_id)
+        return LlmChoice.from_name("qwen", model_id_override=_CLI.llm_model_id)
+    return LlmChoice.from_env_or_default("qwen")
+
+
+LLM_CHOICE = _resolve_llm_choice()
+
+
 def _maybe_autocast(device: str):
     if str(device).startswith("cuda") and torch.cuda.is_available():
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -79,9 +146,9 @@ def _maybe_autocast(device: str):
 
 
 WHISPER_DIM = 768
-LLM_DIM = 4096
+LLM_DIM = LLM_CHOICE.d_llm
 WHISPER_MODEL = "openai/whisper-small"
-LLM_MODEL_ID = "Qwen/Qwen3-8B"
+LLM_MODEL_ID = LLM_CHOICE.model_id
 
 STAGE = Stage1Config()
 OPT = OptimConfig(lr=1e-4, weight_decay=0.01, grad_clip_norm=0.5, warmup_steps=1000)
@@ -96,10 +163,10 @@ CKPT = CheckpointConfig(dir="checkpoints", save_every_steps=500)
 WANDB = WandbConfig(
     enabled=True,
     project="audio-streaming-adapter",
-    run_name="stage1-softmax-infonce",
+    run_name=f"stage1-softmax-infonce-{LLM_CHOICE.name}",
 )
 
-CHECKPOINT_BASENAME = "adapter_softmax_infonce_stage1"
+CHECKPOINT_BASENAME = f"adapter_softmax_infonce_stage1_{LLM_CHOICE.name}"
 SAVE_PATH = os.path.join(CKPT.dir, f"{CHECKPOINT_BASENAME}.pt")
 
 
@@ -140,6 +207,12 @@ def _make_stage1_checkpoint(
         scheduler_state_dict=scheduler.state_dict(),
         metrics=metrics,
         contrastive_logit_scale=float(logit_scale.item()),
+        hyperparams={
+            "llm_choice": LLM_CHOICE.name,
+            "llm_model_id": LLM_MODEL_ID,
+            "d_llm": LLM_DIM,
+            "loss": "softmax_infonce",
+        },
     )
 
 
@@ -177,7 +250,7 @@ def train():
     ctx = init_training_context()
     train_device = ctx.device
     train_device_str = str(train_device)
-    llm_device_str, qwen_map, qwen_max_memory = resolve_llm_load_plan(
+    llm_device_str, llm_map, llm_max_memory = resolve_llm_load_plan(
         ctx=ctx,
         train_device=train_device,
         llm_device=DEVICE_CFG.llm_device,
@@ -191,28 +264,38 @@ def train():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     print(f"Using device: {train_device_str} ({TORCH_DTYPE})")
+    print(f"LLM: {LLM_CHOICE.label} ({LLM_MODEL_ID}), d_llm={LLM_DIM}")
     print(f"LLM device: {llm_device_str}")
     print(f"Visible CUDA devices: {ctx.num_cuda_devices}")
     if ctx.num_cuda_devices >= 2:
-        print("Stage 1 single-GPU mode: Whisper/adapter/Qwen pinned to primary GPU; sibling GPU left free.")
-    if qwen_map:
-        print(f"Qwen device_map: {qwen_map!r}")
-    if qwen_max_memory:
-        print(f"Qwen max_memory: {qwen_max_memory!r}")
+        print(
+            f"Stage 1 single-GPU mode: Whisper/adapter/{LLM_CHOICE.name} "
+            "pinned to primary GPU; sibling GPU left free."
+        )
+    if llm_map:
+        print(f"LLM device_map: {llm_map!r}")
+    if llm_max_memory:
+        print(f"LLM max_memory: {llm_max_memory!r}")
 
     audio = WhisperWindowFeatureExtractor(model_id=WHISPER_MODEL, device=train_device_str, torch_dtype=TORCH_DTYPE)
 
-    qwen_models = load_frozen_qwen_embeddings(
+    llm_models = load_frozen_llm_embeddings(
         model_id=LLM_MODEL_ID,
         device=llm_device_str,
         torch_dtype=TORCH_DTYPE,
-        device_map=qwen_map,
-        max_memory=qwen_max_memory,
+        device_map=llm_map,
+        max_memory=llm_max_memory,
     )
-    llm_tokenizer = qwen_models.tokenizer
-    text_embedder = qwen_models.embedder
+    llm_tokenizer = llm_models.tokenizer
+    text_embedder = llm_models.embedder
     llm_embed_device = llm_input_device(text_embedder)
     print(f"Text embedder device: {llm_embed_device}")
+    embed_dim = int(text_embedder.embedding_dim)
+    if embed_dim != LLM_DIM:
+        raise ValueError(
+            f"LLM hidden size {embed_dim} != configured d_llm={LLM_DIM} "
+            f"for {LLM_MODEL_ID}. Pass a matching --llm / --llm-model-id."
+        )
 
     adapter = StreamingAdapter(
         d_encoder=WHISPER_DIM,
@@ -231,7 +314,7 @@ def train():
 
     print("StreamingAdapter initialized:")
     print(f"  Encoder dim: {WHISPER_DIM}")
-    print(f"  LLM dim: {LLM_DIM}")
+    print(f"  LLM dim: {LLM_DIM} ({LLM_CHOICE.name})")
     print(f"  Max tokens/window: {adapter.num_queries}\n")
 
     # Soft VRAM fence: hold free memory between steps so neighbors cannot grab dips.
@@ -281,6 +364,9 @@ def train():
         config={
             "stage": 1,
             "loss": "softmax_infonce",
+            "llm": LLM_CHOICE.name,
+            "llm_model_id": LLM_MODEL_ID,
+            "d_llm": LLM_DIM,
             "data": {**DATA.__dict__, "dataset_roots": DATASET_ROOTS, "val_root": VAL_ROOT},
             "optim": OPT.__dict__,
             "stage_cfg": STAGE.__dict__,
@@ -317,6 +403,7 @@ def train():
         )
 
     print("Starting Stage 1 training: Audio-Text Alignment (softmax InfoNCE)")
+    print(f"  LLM: {LLM_CHOICE.label} ({LLM_MODEL_ID})")
     print(f"  Dataset splits: {', '.join(os.path.basename(r) for r in DATASET_ROOTS)}")
     if STAGE.val_enabled:
         if os.path.isdir(VAL_ROOT):

@@ -23,30 +23,43 @@ class QwenModels:
 _EMBED_TOKENS_KEY = "model.embed_tokens.weight"
 
 
+def _find_embed_tokens_key(weight_map_or_keys) -> str:
+    keys = list(weight_map_or_keys)
+    if _EMBED_TOKENS_KEY in keys:
+        return _EMBED_TOKENS_KEY
+    for key in keys:
+        if key.endswith("embed_tokens.weight"):
+            return key
+    raise KeyError(f"No embed_tokens weight among keys: {keys[:20]}...")
+
+
 def _load_embedder_only(*, model_id: str, torch_dtype: torch.dtype) -> torch.nn.Embedding:
     """
-    Load only ``embed_tokens`` (~1.2 GiB for Qwen3-8B) instead of the full base model.
+    Load only ``embed_tokens`` instead of the full base model.
 
-    Stage 1 contrastive training needs embedding lookup only; loading ``AutoModel``
-    (~16 GiB) routinely OOMs on 16 GiB GPUs that already host Whisper + adapter.
+    Works for Qwen, Vicuna/Llama, and other HF causal LMs that expose
+    ``model.embed_tokens.weight`` (sharded index or single ``model.safetensors``).
+
+    Stage 1 contrastive training needs embedding lookup only; loading the full
+    LM routinely OOMs on 16 GiB GPUs that already host Whisper + adapter.
     """
     config = AutoConfig.from_pretrained(model_id)
     embedder = torch.nn.Embedding(config.vocab_size, config.hidden_size)
 
-    index_path = hf_hub_download(model_id, "model.safetensors.index.json")
-    with open(index_path, encoding="utf-8") as f:
-        index = json.load(f)
-    weight_map: dict[str, str] = index["weight_map"]
-    weight_key = _EMBED_TOKENS_KEY
-    if weight_key not in weight_map:
-        for key in weight_map:
-            if key.endswith("embed_tokens.weight"):
-                weight_key = key
-                break
-        else:
-            raise KeyError(f"No embed_tokens weight in {model_id} weight map")
-    shard_path = hf_hub_download(model_id, weight_map[weight_key])
-    state = load_file(shard_path)
+    try:
+        index_path = hf_hub_download(model_id, "model.safetensors.index.json")
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+        weight_map: dict[str, str] = index["weight_map"]
+        weight_key = _find_embed_tokens_key(weight_map)
+        shard_path = hf_hub_download(model_id, weight_map[weight_key])
+        state = load_file(shard_path)
+    except Exception:
+        # Single-file safetensors (some Vicuna/Llama mirrors) or missing index.
+        shard_path = hf_hub_download(model_id, "model.safetensors")
+        state = load_file(shard_path)
+        weight_key = _find_embed_tokens_key(state.keys())
+
     embedder.weight.data.copy_(state[weight_key].to(dtype=torch_dtype))
     embedder.eval()
     for param in embedder.parameters():

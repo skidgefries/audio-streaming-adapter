@@ -16,7 +16,8 @@ from training.utils.env import env_str, load_project_env
 load_project_env(str(_pkg_root))
 
 WHISPER_MODEL_ID = env_str("WHISPER_MODEL_ID", "openai/whisper-small") or "openai/whisper-small"
-LLM_MODEL_ID = env_str("LLM_MODEL_ID", "Qwen/Qwen3-8B") or "Qwen/Qwen3-8B"
+# LLM_MODEL_ID = env_str("LLM_MODEL_ID", "Qwen/Qwen3-8B") or "Qwen/Qwen3-8B"
+LLM_MODEL_ID = env_str("LLM_MODEL_ID", "lmsys/vicuna-7b-v1.5") or "lmsys/vicuna-7b-v1.5"
 
 
 def _hf_token() -> str | None:

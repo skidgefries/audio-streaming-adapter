@@ -1424,7 +1424,7 @@ def _run_asr_eval(
     n_windows: int,
     generation: LlmGenerationParams,
     log_every: int,
-    batch_size: int = 16,
+    batch_size: int = 32,
     use_early_commit_truncation: bool = False,
     train_style_asr: bool = True,
     append_im_end: bool = True,
@@ -1525,6 +1525,8 @@ def _run_asr_eval(
                     f"windows={result.get('num_windows_used')} ({elapsed:.1f}s)",
                     flush=True,
                 )
+                print(f"    REF: {ref}", flush=True)
+                print(f"    HYP: {hyp}", flush=True)
             continue
 
         t0 = time.time()
@@ -1588,6 +1590,8 @@ def _run_asr_eval(
                     f"windows={n_used} (~{per_utt:.1f}s/utt, batch={len(batch_pairs)})",
                     flush=True,
                 )
+                print(f"    REF: {ref}", flush=True)
+                print(f"    HYP: {hyp}", flush=True)
 
     avg_wer = sum(p["wer"] for p in items) / max(len(items), 1)
     bleu = _corpus_bleu4(refs, hyps)
@@ -1707,6 +1711,8 @@ def _evaluate_asr_one_variant(
         },
     )
     _write_asr_json(stage_dir / "asr_predictions.json", {"items": items})
+    print(f"Wrote {stage_dir / 'asr_metrics.json'}")
+    print(f"Wrote {stage_dir / 'asr_predictions.json'}")
 
     return {
         "stage": stage,
@@ -1839,8 +1845,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--batch-size",
         type=int,
-        default=env_int("VAL_BATCH_SIZE", 16),
-        help="ASR decode batch size for train-style eval (default: VAL_BATCH_SIZE or 16)",
+        default=env_int("VAL_BATCH_SIZE", 32),
+        help="ASR decode batch size for train-style eval (default: VAL_BATCH_SIZE or 32)",
     )
     im_end = ap.add_mutually_exclusive_group()
     im_end.add_argument("--append-im-end", dest="append_im_end", action="store_true", default=True)

@@ -360,12 +360,27 @@ class TrainingLaunchConfig:
         return visible_gpus >= 2
 
 
+# Defaults for Stage-3 CE/KL — change here only (trainer has no duplicate setdefaults).
+STAGE3_CE_ALPHA_DEFAULT = 1.0
+STAGE3_KL_TEMPERATURE_DEFAULT = 2.0
+
+
 @dataclass(frozen=True)
 class Stage3Config:
-    """Task distillation (teacher/student)."""
+    """
+    Stage-3 ASR distillation.
+
+    New trainer (``adapter_stage3.py``)::
+
+        L = α · CE(answer) + (1 − α) · KL(teacher ‖ student)  on answer tokens only
+
+    Legacy fields (``lambda_*``, rate controller) remain for ``adapter_task_trainer.py``.
+    """
 
     epochs: int = 15
-    kl_temperature: float = 2.0
+    kl_temperature: float = STAGE3_KL_TEMPERATURE_DEFAULT
+    # Weight on hard CE; (1 - alpha) weights soft KL against GT-transcript teacher logits.
+    alpha: float = STAGE3_CE_ALPHA_DEFAULT
     lambda_asr: float = 0.1
     lambda_stability: float = 0.05
     lambda_rate: float = 0.001
@@ -373,6 +388,51 @@ class Stage3Config:
 
     use_rate_controller: bool = True
     rate_target: float = 2.0
+    max_text_tokens: int = 128
+    asr_micro_batch_size: int = 1
+    enable_llm_gradient_checkpointing: bool = False
+    val_enabled: bool = True
+    val_every_steps: int = 1000
+    val_max_utterances: int | None = 100
+    val_max_new_tokens: int = 496
+    val_num_beams: int = 1
+    val_repetition_penalty: float = 1.25
+    val_log_every: int = 50
+
+    @classmethod
+    def from_env(cls) -> Stage3Config:
+        """Build Stage-3 config from environment variables."""
+        val_max_raw = env_str("VAL_MAX_UTTERANCES")
+        val_max_utterances: int | None = 100
+        if val_max_raw:
+            normalized = val_max_raw.strip().lower()
+            if normalized in {"all", "none", "unlimited"}:
+                val_max_utterances = None
+            else:
+                val_max_utterances = int(val_max_raw)
+        return cls(
+            epochs=env_int("EPOCHS", 15),
+            kl_temperature=env_float("KL_TEMPERATURE", STAGE3_KL_TEMPERATURE_DEFAULT),
+            alpha=env_float("CE_ALPHA", STAGE3_CE_ALPHA_DEFAULT),
+            lambda_asr=env_float("LAMBDA_ASR", 0.1),
+            lambda_stability=env_float("LAMBDA_STABILITY", 0.05),
+            lambda_rate=env_float("LAMBDA_RATE", 0.001),
+            lambda_gate=env_float("LAMBDA_GATE", 0.5),
+            use_rate_controller=env_bool("USE_RATE_CONTROLLER", False),
+            rate_target=env_float("RATE_TARGET", 2.0),
+            max_text_tokens=env_int("MAX_TEXT_TOKENS", 128),
+            asr_micro_batch_size=env_int("ASR_MICRO_BATCH_SIZE", 1),
+            enable_llm_gradient_checkpointing=env_bool(
+                "ENABLE_LLM_GRADIENT_CHECKPOINTING", False
+            ),
+            val_enabled=env_bool("VAL_ENABLED", True),
+            val_every_steps=env_int("VAL_EVERY_STEPS", 1000),
+            val_max_utterances=val_max_utterances,
+            val_max_new_tokens=env_int("VAL_MAX_NEW_TOKENS", 496),
+            val_num_beams=env_int("VAL_NUM_BEAMS", 1),
+            val_repetition_penalty=env_float("VAL_REPETITION_PENALTY", 1.25),
+            val_log_every=env_int("VAL_LOG_EVERY", 50),
+        )
 
 
 @dataclass(frozen=True)
@@ -406,6 +466,66 @@ class FrozenModelIdsConfig:
             or "openai/whisper-small",
             llm_model_id=env_str("LLM_MODEL_ID", "Qwen/Qwen3-8B") or "Qwen/Qwen3-8B",
         )
+
+
+# Stage-1 contrastive LLM presets (embeddings-only path works for both).
+LLM_CHOICES = ("qwen", "vicuna")
+
+LLM_PRESETS: dict[str, dict[str, str | int]] = {
+    "qwen": {
+        "model_id": "Qwen/Qwen3-8B",
+        "d_llm": 4096,
+        "label": "Qwen3-8B",
+    },
+    "vicuna": {
+        "model_id": "lmsys/vicuna-7b-v1.5",
+        "d_llm": 4096,
+        "label": "Vicuna-7B-v1.5",
+    },
+}
+
+
+@dataclass(frozen=True)
+class LlmChoice:
+    """Resolved LLM for Stage 1 contrastive trainers."""
+
+    name: str
+    model_id: str
+    d_llm: int
+    label: str
+
+    @classmethod
+    def from_name(
+        cls,
+        name: str,
+        *,
+        model_id_override: str | None = None,
+    ) -> "LlmChoice":
+        key = (name or "qwen").strip().lower()
+        if key not in LLM_PRESETS:
+            raise ValueError(
+                f"Unknown LLM {name!r}; choose one of {LLM_CHOICES}"
+            )
+        preset = LLM_PRESETS[key]
+        model_id = model_id_override or str(preset["model_id"])
+        return cls(
+            name=key,
+            model_id=model_id,
+            d_llm=int(preset["d_llm"]),
+            label=str(preset["label"]),
+        )
+
+    @classmethod
+    def from_env_or_default(cls, default: str = "qwen") -> "LlmChoice":
+        """Resolve from ``LLM_CHOICE`` / ``LLM_MODEL_ID`` env, else ``default``."""
+        choice = env_str("LLM_CHOICE", default) or default
+        override = env_str("LLM_MODEL_ID")
+        # If only LLM_MODEL_ID is set and matches a known preset id, keep that name.
+        if override and env_str("LLM_CHOICE") is None:
+            for name, preset in LLM_PRESETS.items():
+                if override == preset["model_id"]:
+                    return cls.from_name(name, model_id_override=override)
+        return cls.from_name(choice, model_id_override=override)
 
 
 @dataclass(frozen=True)

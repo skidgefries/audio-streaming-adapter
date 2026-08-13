@@ -88,8 +88,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--batch-size",
         type=int,
-        default=env_int("VAL_BATCH_SIZE", 16),
-        help="ASR decode batch size for train-style eval (default: VAL_BATCH_SIZE or 16)",
+        default=env_int("VAL_BATCH_SIZE", 32),
+        help="ASR decode batch size for train-style eval (default: VAL_BATCH_SIZE or 32)",
     )
     im_end = ap.add_mutually_exclusive_group()
     im_end.add_argument("--append-im-end", dest="append_im_end", action="store_true", default=True)

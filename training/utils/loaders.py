@@ -33,6 +33,7 @@ def load_frozen_qwen_embeddings(
     device_map="auto",
     max_memory: dict[int, str] | None = None,
 ) -> QwenModels:
+    """Load frozen input embeddings for a HF causal LM (Qwen, Vicuna/Llama, …)."""
     cfg = QwenConfig(
         model_id=model_id,
         device=device,
@@ -42,6 +43,10 @@ def load_frozen_qwen_embeddings(
         embeddings_only=True,
     )
     return load_qwen_models(cfg=cfg)
+
+
+# Alias: Stage 1 contrastive path is embeddings-only and LLM-agnostic.
+load_frozen_llm_embeddings = load_frozen_qwen_embeddings
 
 
 def load_frozen_qwen_causal_lm(
