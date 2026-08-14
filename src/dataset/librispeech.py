@@ -88,13 +88,34 @@ class LibriSpeechPairsCustom(Dataset):
 
 
 def load_mono_waveform_16k(audio_path: str) -> torch.Tensor:
-    """Load audio with librosa and resample to 16k mono. Returns CPU float tensor."""
-    import librosa
+    """Decode audio to 16 kHz mono float32 on CPU.
 
-    waveform, sample_rate = librosa.load(audio_path, sr=None)
-    if waveform.ndim > 1:
-        waveform = librosa.to_mono(waveform)
-    if sample_rate != 16000:
-        waveform = librosa.resample(waveform, orig_sr=sample_rate, target_sr=16000)
-    return torch.tensor(waveform, dtype=torch.float32)
+    FLAC/WAV decode is CPU-only (no CUDA codec). Prefer this from DataLoader
+    workers so the GPU is not stalled on I/O. Whisper log-mel + encode should
+    run on CUDA after the tensor is moved.
+    """
+    import torchaudio
+
+    waveform, sample_rate = torchaudio.load(audio_path)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    waveform = waveform.reshape(-1).contiguous().float()
+    if int(sample_rate) != 16000:
+        waveform = torchaudio.functional.resample(waveform, int(sample_rate), 16000)
+    return waveform
+
+
+class LibriSpeechWaveformPairs(LibriSpeechPairs):
+    """Same index as ``LibriSpeechPairs``, but ``__getitem__`` also decodes audio."""
+
+    def __getitem__(self, idx: int) -> tuple[str, str, torch.Tensor]:
+        audio_path, transcription = self.pairs[idx]
+        return audio_path, transcription, load_mono_waveform_16k(audio_path)
+
+
+def collate_librispeech_waveforms(
+    batch: list[tuple[str, str, torch.Tensor]],
+) -> tuple[list[str], list[str], list[torch.Tensor]]:
+    paths, texts, waves = zip(*batch, strict=True)
+    return list(paths), list(texts), list(waves)
 

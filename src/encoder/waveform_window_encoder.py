@@ -14,7 +14,7 @@ import torch
 
 from adapter.windowing import AudioWaveformWindowizer
 
-from .whisper_encoder import encode_waveform_to_hidden, load_whisper_models
+from .whisper_encoder import encode_waveforms_to_hidden, load_whisper_models
 
 
 class WhisperWindowFeatureExtractor:
@@ -51,10 +51,15 @@ class WhisperWindowFeatureExtractor:
             stride_seconds=self.stride_seconds,
         )
 
-    def waveform_to_windows(self, waveform_16k_mono: torch.Tensor) -> list[torch.Tensor]:
+    def waveform_to_windows(
+        self,
+        waveform_16k_mono: torch.Tensor,
+        max_windows: int | None = None,
+    ) -> list[torch.Tensor]:
         """
         Args:
             waveform_16k_mono: 1D CPU or CUDA tensor (audio samples at ``sample_rate``)
+            max_windows: If set, encode at most this many chunks (after windowizing).
 
         Returns:
             List of encoder windows, each ``(1, 1500, D_enc)`` on ``device``.
@@ -69,15 +74,16 @@ class WhisperWindowFeatureExtractor:
 
         dev = torch.device(self.device)
         audio_chunks = self._audio_windowizer(wave)
-        enc_windows: list[torch.Tensor] = []
-        for chunk in audio_chunks:
-            enc = encode_waveform_to_hidden(
-                chunk,
-                whisper_processor=self.processor,
-                whisper_model=self.whisper,
-                device=self.device,
-                torch_dtype=self.torch_dtype,
-                sample_rate=self.sample_rate,
-            ).to(device=dev, dtype=self.torch_dtype)
-            enc_windows.append(enc.contiguous())
-        return enc_windows
+        if max_windows is not None:
+            audio_chunks = audio_chunks[:max_windows]
+        if not audio_chunks:
+            return []
+        hidden = encode_waveforms_to_hidden(
+            audio_chunks,
+            whisper_processor=self.processor,
+            whisper_model=self.whisper,
+            device=self.device,
+            torch_dtype=self.torch_dtype,
+            sample_rate=self.sample_rate,
+        ).to(device=dev, dtype=self.torch_dtype)
+        return [hidden[i : i + 1].contiguous() for i in range(hidden.shape[0])]

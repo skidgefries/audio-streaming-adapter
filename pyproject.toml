@@ -21,6 +21,8 @@ dependencies = [
     "transformers>=5.5.0",
     "wandb>=0.25.1",
     "optuna>=4.0.0",
+    "sentencepiece>=0.2.2",
+    "protobuf>=7.34.1",
 ]
 
 [build-system]

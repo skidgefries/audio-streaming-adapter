@@ -12,6 +12,7 @@ from .whisper_encoder import (
     WhisperModels,
     encode_dataset_stream,
     encode_waveform_to_hidden,
+    encode_waveforms_to_hidden,
     get_encoder_output,
     load_whisper_models,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "WhisperModels",
     "load_whisper_models",
     "encode_waveform_to_hidden",
+    "encode_waveforms_to_hidden",
     "get_encoder_output",
     "encode_dataset_stream",
     "WhisperAsrModels",

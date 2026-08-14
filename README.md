@@ -367,7 +367,13 @@ Each stage uploads only its own epoch files (`adapter_stage1_epoch{N}.pt`, `adap
 
 **Walkthrough:** `notebooks/training_stage2_asr.ipynb` — follow cells top-to-bottom; align hyperparameters with `Stage2Config`, `DeviceConfig`, `OptimConfig`, and constants at the top of `adapter_asr_trainer.py`.
 
-**Vicuna ASR + align** (`training/adapter_asr_align_vicuna_trainer.py`): same Stage 2 simplified loss (ASR + InfoNCE align + stability) as `adapter_asr_align_trainer.py`, but the frozen LM is **Vicuna-7B** (`lmsys/vicuna-7b-v1.5`, override with `VICUNA_MODEL_ID`). Weights load from the Hugging Face cache when present. Micro-batch is `BATCH_SIZE` (default **16**); effective optimizer batch is `MACRO_BATCH_SIZE` (default **128**, 8 accumulation steps). Warm-start adapter weights from `STAGE1_CHECKPOINT`; resume Stage 2 from `RESUME_CHECKPOINT` when set. Writes `checkpoints/adapter_asr_align_vicuna.pt` (override with `CHECKPOINT_BASENAME`).
+**Vicuna ASR + align** (`training/adapter_asr_align_vicuna_trainer.py`): same Stage 2 simplified loss (ASR + InfoNCE align + stability) as `adapter_asr_align_trainer.py`, but the frozen LM is **Vicuna-7B** (`lmsys/vicuna-7b-v1.5`, override with `VICUNA_MODEL_ID`). Weights load from the Hugging Face cache when present. Micro-batch is `BATCH_SIZE` (default **64**); effective optimizer batch is `MACRO_BATCH_SIZE` (default **128**, 2 accumulation steps). `ASR_MICRO_BATCH_SIZE` (default **64**) chunks the batched Vicuna CE forward. Audio is decoded with **torchaudio in DataLoader workers** (FLAC cannot run on GPU); Whisper log-mel STFT and encoder run on CUDA in window batches. Console and W&B log once per optimizer step (metrics averaged over the 2 micro-batches). Warm-start adapter weights from `STAGE1_CHECKPOINT` (default local file: `checkpoints/adapter_softmax_infonce_vicuna_stage1_epoch6.pt`, sourced from [`skidgefries/vicuna_stage1_bs128-smallerdataset`](https://huggingface.co/skidgefries/vicuna_stage1_bs128-smallerdataset)). Use `STAGE1_CHECKPOINT_HF_TOKEN` (or `HF_TOKEN`) if that Hub repo is gated. Resume Stage 2 from `RESUME_CHECKPOINT` when set. Writes `checkpoints/adapter_asr_align_vicuna.pt` (override with `CHECKPOINT_BASENAME`) and `checkpoints/adapter_asr_align_vicuna_epoch{N}.pt` after **each epoch** (this trainer disables shared `.env` `SAVE_EVERY_STEPS` mid-epoch saves). Validation runs at the **end of each epoch** on **100** LibriSpeech **dev-clean** utterances (overrides shared `.env` `VAL_MAX_UTTERANCES=all`).
+
+Prefetch Vicuna into the Hugging Face cache (`VICUNA_MODEL_ID`, default `lmsys/vicuna-7b-v1.5`; uses `HF_TOKEN` when set):
+
+```bash
+uv run python scripts/prefetch_vicuna.py
+```
 
 ```bash
 cd audio-streaming-adapter
@@ -755,9 +761,11 @@ STRIDE_FRAMES = 40        # 0.8s (no overlap)
 - Check that all dependencies are installed
 
 **Slow Training:**
+- Decode audio in DataLoader workers (`NUM_WORKERS`, default 8 for Vicuna ASR+align); do not run librosa on the training process
+- Whisper log-mel/encoder should stay on CUDA (not CPU numpy round-trips)
 - Enable mixed precision (already enabled in training scripts)
-- Reduce number of workers in dataloader
-- Use smaller window size (e.g., 0.6s instead of 0.8s)
+- If GPU util is still low, the adapter still steps windows sequentially (streaming state)
+- Use smaller window size (e.g., 0.6s instead of 0.8s) only if you need fewer Whisper encodes
 
 ### Debug Mode
 
