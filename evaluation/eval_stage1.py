@@ -68,8 +68,13 @@ from training.utils.devices import (
     resolve_device,
     visible_gpu_count,
 )
-from training.utils.env import env_int, env_optional_int, load_project_env
-from training.utils.loaders import load_frozen_qwen_causal_lm, load_frozen_qwen_embeddings
+from training.utils.env import env_int, env_optional_int, env_str, load_project_env
+from training.utils.loaders import (
+    load_frozen_qwen_causal_lm,
+    load_frozen_qwen_embeddings,
+    load_frozen_vicuna_causal_lm,
+    load_frozen_vicuna_embeddings,
+)
 from training.utils.stage1_validation import (
     compute_retrieval_metrics,
     compute_retrieval_metrics_from_cost_matrix,
@@ -104,7 +109,11 @@ def _resolve_use_rate_controller(
     if stage != 2:
         return False
     trainer = _ckpt_trainer_name(ckpt)
-    if trainer in ("adapter_asr_align_trainer", "adapter_asr_only_trainer"):
+    if trainer in (
+        "adapter_asr_align_trainer",
+        "adapter_asr_align_vicuna_trainer",
+        "adapter_asr_only_trainer",
+    ):
         return False
     if _ckpt_has_rate_controller(ckpt):
         return True
@@ -190,6 +199,87 @@ def qwen_device_map_and_max_memory(
     if max_memory is None:
         return None, None
     return "sequential", max_memory
+
+
+DEFAULT_STAGE1_LLM_ID = "lmsys/vicuna-7b-v1.5"
+
+
+def _is_vicuna_model(model_id: str) -> bool:
+    """True when the HF id is a Vicuna checkpoint (Stage 1 softmax trainer)."""
+    return "vicuna" in str(model_id).lower()
+
+
+def _resolve_eval_model_ids(stage: int) -> FrozenModelIdsConfig:
+    """
+    Stage 1 eval uses Vicuna-7B (same as ``adapter_contrastive_trainer_softmax``).
+
+    ``LLM_MODEL_ID`` in ``.env`` stays Qwen for Stage 2; override Vicuna with
+    ``VICUNA_MODEL_ID``.
+    """
+    ids = FrozenModelIdsConfig.from_env()
+    if stage != 1:
+        return ids
+    vicuna_id = env_str("VICUNA_MODEL_ID", DEFAULT_STAGE1_LLM_ID) or DEFAULT_STAGE1_LLM_ID
+    return FrozenModelIdsConfig(
+        whisper_model_id=ids.whisper_model_id,
+        llm_model_id=vicuna_id,
+    )
+
+
+def _load_eval_embeddings(
+    *,
+    model_id: str,
+    device: str,
+    torch_dtype: torch.dtype,
+    device_map="auto",
+    max_memory: dict[int, str] | None = None,
+):
+    """Load frozen text embeddings: Vicuna for Stage 1, Qwen otherwise."""
+    if _is_vicuna_model(model_id):
+        print(f"Loading Vicuna embedder ({model_id})...")
+        return load_frozen_vicuna_embeddings(
+            model_id=model_id,
+            device=device,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            max_memory=max_memory,
+        )
+    print(f"Loading Qwen embedder ({model_id})...")
+    return load_frozen_qwen_embeddings(
+        model_id=model_id,
+        device=device,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+        max_memory=max_memory,
+    )
+
+
+def _load_eval_causal_lm(
+    *,
+    model_id: str,
+    device: str,
+    torch_dtype: torch.dtype,
+    device_map="auto",
+    max_memory: dict[int, str] | None = None,
+):
+    """Load frozen causal LM: Vicuna for Stage 1, Qwen otherwise."""
+    if _is_vicuna_model(model_id):
+        print(f"Loading Vicuna causal LM ({model_id})...")
+        return load_frozen_vicuna_causal_lm(
+            model_id=model_id,
+            device=device,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            max_memory=max_memory,
+        )
+    print(f"Loading Qwen causal LM ({model_id})...")
+    return load_frozen_qwen_causal_lm(
+        model_id=model_id,
+        device=device,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+        max_memory=max_memory,
+    )
 
 
 def release_cuda_memory() -> None:
@@ -420,15 +510,14 @@ def _load_cosine_models(
         torch_dtype=torch_dtype,
     )
 
-    print("Loading Qwen embedder...")
-    qwen_models = load_frozen_qwen_embeddings(
+    llm_models = _load_eval_embeddings(
         model_id=llm_model_id,
         device=device_str,
         torch_dtype=torch_dtype,
         device_map=llm_map,
         max_memory=max_memory,
     )
-    llm_device = llm_input_device(qwen_models.embedder)
+    llm_device = llm_input_device(llm_models.embedder)
 
     label = "Stage 2 adapter" if stage == 2 else "adapter"
     print(f"Loading {label} from checkpoint...")
@@ -454,7 +543,7 @@ def _load_cosine_models(
         f"  epoch={ckpt.get('epoch', '?')} step={ckpt.get('global_step', '?')}{extra}\n"
     )
 
-    return audio, qwen_models.tokenizer, qwen_models.embedder, adapter, llm_device, ckpt
+    return audio, llm_models.tokenizer, llm_models.embedder, adapter, llm_device, ckpt
 
 @torch.no_grad()
 def _compute_cosine_embeddings(
@@ -519,7 +608,7 @@ def run_retrieval_cosine(*, stage: int, args: argparse.Namespace) -> None:
     if stage not in (1, 2):
         raise ValueError(f"stage must be 1 or 2, got {stage}")
 
-    model_ids = FrozenModelIdsConfig.from_env()
+    model_ids = _resolve_eval_model_ids(stage)
     stage2 = Stage2Config.from_env() if stage == 2 else None
 
     if not os.path.isfile(args.checkpoint):
@@ -533,11 +622,12 @@ def run_retrieval_cosine(*, stage: int, args: argparse.Namespace) -> None:
 
     print(
         f"Device: {device} (visible CUDA devices: {num_cuda}; "
-        f"Whisper/adapter on {device}, Qwen device_map={llm_map!r})"
+        f"Whisper/adapter on {device}, LLM={model_ids.llm_model_id} "
+        f"device_map={llm_map!r})"
     )
-    print(f"Qwen device_map: {llm_map!r}")
+    print(f"LLM device_map: {llm_map!r}")
     if llm_max_memory:
-        print(f"Qwen max_memory: {llm_max_memory!r}")
+        print(f"LLM max_memory: {llm_max_memory!r}")
 
     print(f"Loading test-clean from {args.dataset_root}...")
     dataset = LibriSpeechPairs(args.dataset_root)
@@ -664,22 +754,21 @@ def _load_nll_audio_encoder_and_adapter(
 def _load_nll_llm(*, device: torch.device, torch_dtype: torch.dtype, llm_model_id: str):
     device_str = str(device)
     device_map, max_memory = qwen_device_map_and_max_memory()
-    print("Loading Qwen causal LM...")
     if max_memory:
         print(f"  device_map={device_map!r} max_memory={max_memory!r}")
-    qwen_models = load_frozen_qwen_causal_lm(
+    llm_models = _load_eval_causal_lm(
         model_id=llm_model_id,
         device=device_str,
         torch_dtype=torch_dtype,
         device_map=device_map,
         max_memory=max_memory,
     )
-    llm = qwen_models.causal_lm
+    llm = llm_models.causal_lm
     llm_device = llm_input_device(llm)
     if device_map is None and llm_device != device:
-        raise RuntimeError(f"Qwen expected on {device}, found on {llm_device}")
-    print(f"  Qwen causal LM input device: {llm_device}\n")
-    return qwen_models.tokenizer, llm, qwen_models.embedder, llm_device
+        raise RuntimeError(f"LLM expected on {device}, found on {llm_device}")
+    print(f"  Causal LM ({llm_model_id}) input device: {llm_device}\n")
+    return llm_models.tokenizer, llm, llm_models.embedder, llm_device
 
 
 @torch.no_grad()
@@ -890,7 +979,7 @@ def run_retrieval_nll(*, stage: int, args: argparse.Namespace) -> None:
     if stage not in (1, 2):
         raise ValueError(f"stage must be 1 or 2, got {stage}")
 
-    model_ids = FrozenModelIdsConfig.from_env()
+    model_ids = _resolve_eval_model_ids(stage)
     stage2 = Stage2Config.from_env() if stage == 2 else None
 
     if not os.path.isfile(args.checkpoint):
@@ -933,10 +1022,11 @@ def run_retrieval_nll(*, stage: int, args: argparse.Namespace) -> None:
 
         print(
             f"Device: {device} (visible CUDA devices: {num_cuda}; "
-            f"Whisper/adapter on {device}, Qwen device_map={llm_map!r})"
+            f"Whisper/adapter on {device}, LLM={model_ids.llm_model_id} "
+            f"device_map={llm_map!r})"
         )
         if llm_max_memory:
-            print(f"Qwen max_memory: {llm_max_memory!r}")
+            print(f"LLM max_memory: {llm_max_memory!r}")
 
         print(f"Loading test-clean from {args.dataset_root}...")
         dataset = LibriSpeechPairs(args.dataset_root)
@@ -1283,7 +1373,7 @@ def _build_asr_pipeline(
             torch_dtype=torch_dtype,
         )
     )
-    qwen = load_frozen_qwen_causal_lm(
+    llm_models = _load_eval_causal_lm(
         model_id=model_ids.llm_model_id,
         device=device,
         torch_dtype=torch_dtype,
@@ -1339,8 +1429,8 @@ def _build_asr_pipeline(
         whisper_model=whisper.model,
         windowizer=windowizer,
         streaming_adapter=adapter,
-        llm_model=qwen.causal_lm,
-        llm_tokenizer=qwen.tokenizer,
+        llm_model=llm_models.causal_lm,
+        llm_tokenizer=llm_models.tokenizer,
         device=device,
         torch_dtype=torch_dtype,
     )
@@ -1730,7 +1820,7 @@ def run_asr(*, stage: int, args: argparse.Namespace) -> None:
 
         args.asr_prompt = DEFAULT_ASR_PROMPT
 
-    model_ids = FrozenModelIdsConfig.from_env()
+    model_ids = _resolve_eval_model_ids(stage)
     stage2 = Stage2Config.from_env()
     device_obj, torch_dtype, _ = init_eval_device()
     device = str(device_obj)
@@ -1750,9 +1840,9 @@ def run_asr(*, stage: int, args: argparse.Namespace) -> None:
     elif args.llm_device_map != "auto":
         llm_map = args.llm_device_map
 
-    print(f"Device: {device}  Qwen device_map: {llm_map!r}")
+    print(f"Device: {device}  LLM={model_ids.llm_model_id}  device_map: {llm_map!r}")
     if llm_max_memory:
-        print(f"Qwen max_memory: {llm_max_memory!r}")
+        print(f"LLM max_memory: {llm_max_memory!r}")
 
     base_run_name = resolve_run_name(args.checkpoint, args.run_name)
     im_end_variants = [True, False] if args.compare_im_end else [args.append_im_end]

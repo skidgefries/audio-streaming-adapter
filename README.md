@@ -199,6 +199,30 @@ Work from the **`audio-streaming-adapter/`** directory so `training/` and `check
 
 **What it does:** Aligns adapter token embeddings with frozen LLM text embeddings; loss `L = L_align + λ_stability · L_stability` using `training.utils.losses.contrastive_infonce_loss` and mean stability from `StreamingAdapter.forward_window`. Audio features use **`WhisperWindowFeatureExtractor`**: **`AudioWaveformWindowizer`** (0.8s / 0.4s on raw waveform) → one Whisper encode per chunk — same as `adapter_contrastive_trainer.py`.
 
+**Softmax InfoNCE + GradCache** (`training/adapter_contrastive_trainer_softmax.py`): InfoNCE uses a true macro-batch of in-batch negatives (`MACRO_BATCH_SIZE`, default **128**) while encoding only `BATCH_SIZE` utterances at a time (default **8**) so peak VRAM stays at the micro-batch. This is **not** ordinary gradient accumulation — the similarity matrix is `128×128`. Implementation: `training/utils/grad_cache.py`.
+
+GradCache runs the adapter in **`eval()`** for both the cache and recompute passes (disables dropout so representation grads match the surrogate; no BatchNorm in the adapter), then restores `train()`. Softmax defaults when env is unset: `λ_stability=0.01`, `grad_clip_norm=2.0` (so Align is not dominated by stability + hard clip early). W&B / console log `diag/pos_minus_neg` and per-term adapter grad norms `train/grad_norm_align` vs `train/grad_norm_stab`.
+
+Set `RANDOM_SEED` (default `42`) to reproduce runs; the seed is stored in checkpoint `hyperparams`.
+
+**2-GPU training (recommended):**
+
+```bash
+cd audio-streaming-adapter
+# Data-parallel: each rank encodes 64, all-gather → InfoNCE batch 128
+RANDOM_SEED=42 BATCH_SIZE=8 MACRO_BATCH_SIZE=128 \
+  uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+  training/adapter_contrastive_trainer_softmax.py
+```
+
+**Single process (still uses both GPUs when visible):** Whisper/adapter on `cuda:0`, text embeddings on `cuda:1`.
+
+```bash
+cd audio-streaming-adapter
+# Optional: BATCH_SIZE=8 MACRO_BATCH_SIZE=128 RANDOM_SEED=42
+uv run python training/adapter_contrastive_trainer_softmax.py
+```
+
 **CLI (full training):**
 
 ```bash
@@ -209,6 +233,108 @@ uv run python training/adapter_contrastive_trainer.py
 **Walkthrough:** open `notebooks/training_stage1_contrastive.ipynb`. Earlier cells dissect components; the section **“Full training (script-equivalent)”** runs the same loop as the CLI (set `MAX_STEPS_DEBUG` to a small integer for a smoke test).
 
 **Defaults (see `training/utils/config.py` + script top):** epochs 5, batch size 4, LR `1e-4`, SGD + linear warmup (`warmup_steps=100`), `λ_stability=0.1`, temperature `0.2`, `checkpoints/adapter_adapter.pt`.
+
+#### Stage 1 Vicuna Optuna (Case 1)
+
+Self-contained experiment at **`../experiments/stage1-optuna-vicuna/`** (workspace sibling to `audio-streaming-adapter/`). Trains a new **`StreamingAdapterAttention`** (Q-Former only, no rate controller) with frozen **Whisper-small** + **Vicuna-7B** embeddings on **LibriSpeech train-clean-100**, validates **dev-clean** and evaluates **test-clean** after each epoch, and sweeps adapter architecture with **Optuna** + **WandB**.
+
+**Layout:**
+
+```
+experiments/stage1-optuna-vicuna/
+  pyproject.toml                  # separate uv project (own .venv)
+  deps/                           # vendored adapter, dataset, encoder (self-contained)
+  stage1_optuna_case1.py          # CLI entry point (recommended)
+  stage1_optuna_case1.ipynb
+  streaming_adapter_attention.py
+  vicuna_loader.py
+  losses.py
+  validation.py
+  wandb_logging.py
+  train.py
+  checkpoints/trial_{n}/
+  optuna_case1.db
+  datasets/librispeech_data/LibriSpeech/   # optional local data copy
+```
+
+**Remote deployment:** copy the entire `stage1-optuna-vicuna/` directory to the server (includes `deps/` — no separate `audio-streaming-adapter/src/` required). Point LibriSpeech data via env or place under `datasets/` inside the experiment dir:
+
+```bash
+export LIBRISPEECH_BASE=/path/to/LibriSpeech   # contains train-clean-100/, dev-clean/, test-clean/
+# or: datasets/librispeech_data/LibriSpeech/ inside the experiment directory
+```
+
+**Setup:**
+
+```bash
+cd stage1-optuna-vicuna   # on remote: e.g. /workspace/audio-streaming-adapter
+uv sync
+# optional: WANDB_API_KEY, HF_TOKEN, LIBRISPEECH_BASE in .env
+```
+
+`paths.py` loads `stage1-optuna-vicuna/.env` on import, so the CLI script, the notebook, and direct `train.py` use all pick up the same credentials. Real environment variables take precedence over `.env`, and `.env` is gitignored — keep secrets out of commits.
+
+The experiment `pyproject.toml` has its own `.venv`. All Python dependencies for adapter/dataset/encoder are vendored under `deps/`.
+
+**Run (recommended — Python script):**
+
+```bash
+cd experiments/stage1-optuna-vicuna
+
+# Full Optuna study (20 trials)
+uv run python stage1_optuna_case1.py
+
+# Smoke test (single fixed architecture, 3 epochs)
+uv run python stage1_optuna_case1.py --smoke-test
+
+# Custom trial count
+uv run python stage1_optuna_case1.py --n-trials 5
+```
+
+**Run (Jupyter notebook):**
+
+```bash
+cd experiments/stage1-optuna-vicuna
+uv run python -m ipykernel install --user --name stage1-optuna-vicuna --display-name "stage1-optuna-vicuna"
+uv run jupyter lab stage1_optuna_case1.ipynb
+```
+
+In Jupyter, select kernel **stage1-optuna-vicuna** (uses `experiments/stage1-optuna-vicuna/.venv`).
+
+**Fixed hyperparameters:** `lr=1e-4`, `num_queries=2`, `epochs=3`, Softmax InfoNCE + learnable temperature.
+
+**Reproducibility:** `--seed` (default `42`) sets the base seed. Trial *N* runs with **`seed + N`**, so trials differ from one another while each stays a pure function of `(base_seed, trial_number)` — any single trial can be replayed in isolation. The seed is applied before adapter init and covers Python, NumPy, and Torch RNGs, the shuffle generator, and DataLoader workers; the same seed also drives the `TPESampler`, so the search sequence itself repeats. Each trial records its seed in the WandB config (`trial_seed`), a `seed=<n>` tag, the run summary, and every saved checkpoint.
+
+```bash
+# reproduce trial 7 of a seed-42 study on its own
+uv run python stage1_optuna_case1.py --smoke-test --seed 49   # 42 + 7
+```
+
+Add `--deterministic` to force deterministic cuDNN kernels for bit-exact reruns — slower, and only needed when comparing weights exactly rather than reproducing the setup.
+
+**Optuna Case 1 search space:**
+
+| Param | Values |
+|---|---|
+| `num_layers` | `{2, 4, 6, 8, 10}` |
+| `cross_layer_in_between` | `{1, 2, 4, 8}` |
+| `num_heads` | `{4, 8, 12}` |
+| `d_ffn` | `{1024, 2048, 4096}` |
+
+Invalid combos (`cross_layer_in_between >= num_layers`) are pruned. Objective: maximize final-epoch **val/recall_at_1**.
+
+**Data:** uses `audio-streaming-adapter/datasets/librispeech_data/LibriSpeech/{train-clean-100,dev-clean,test-clean}`.
+
+**WandB logging** (`wandb_logging.py`): logs to project `--wandb-project` (default `stage1-optuna-vicuna`, separate from the main `audio-streaming-adapter` project) — one run per Optuna trial, named `L{num_layers}_C{cross_layer}_H{num_heads}_F{d_ffn}_t{trial}` and grouped under `--wandb-group` (default `stage1-vicuna-optuna-case1`), tagged with each sampled hyperparameter. Logged per run:
+
+| Scope | Keys |
+|---|---|
+| Config | full `ExperimentConfig` + sampled hyperparameters + `trial_number` + `trial_seed` |
+| Train (every 10 steps) | `train/{loss,align,stability,lr,temperature}`, `diag/{pos_sim,neg_sim,pos_minus_neg}` |
+| Epoch end | `val/*` and `test/*` (loss, align, stability, similarity diagnostics, `recall_at_{1,5,10}`) |
+| Summary | `best_val_recall_at_1`, `final_val_recall_at_1`, `checkpoint_dir` |
+
+Credentials resolve in this order: `WANDB_MODE=offline` (no credentials needed) → `WANDB_API_KEY` (env or experiment `.env`) → `wandb login` / `~/.netrc`. If none are found, the run continues with console-only output and prints a warning at trial start. Pass `--no-wandb` to disable logging intentionally.
 
 ### Stage 2: ASR distillation
 
@@ -240,6 +366,13 @@ HF_UPLOAD_CHECKPOINTS=true
 Each stage uploads only its own epoch files (`adapter_stage1_epoch{N}.pt`, `adapter_stage2_epoch{N}.pt`, `adapter_stage3_epoch{N}.pt`, …). Uploads are **additive** — existing files from other stages stay in the repo. Local resume checkpoints (`adapter_stage{N}.pt`) are not uploaded.
 
 **Walkthrough:** `notebooks/training_stage2_asr.ipynb` — follow cells top-to-bottom; align hyperparameters with `Stage2Config`, `DeviceConfig`, `OptimConfig`, and constants at the top of `adapter_asr_trainer.py`.
+
+**Vicuna ASR + align** (`training/adapter_asr_align_vicuna_trainer.py`): same Stage 2 simplified loss (ASR + InfoNCE align + stability) as `adapter_asr_align_trainer.py`, but the frozen LM is **Vicuna-7B** (`lmsys/vicuna-7b-v1.5`, override with `VICUNA_MODEL_ID`). Weights load from the Hugging Face cache when present. Micro-batch is `BATCH_SIZE` (default **16**); effective optimizer batch is `MACRO_BATCH_SIZE` (default **128**, 8 accumulation steps). Warm-start adapter weights from `STAGE1_CHECKPOINT`; resume Stage 2 from `RESUME_CHECKPOINT` when set. Writes `checkpoints/adapter_asr_align_vicuna.pt` (override with `CHECKPOINT_BASENAME`).
+
+```bash
+cd audio-streaming-adapter
+uv run training/adapter_asr_align_vicuna_trainer.py
+```
 
 ### Evaluation (LibriSpeech test-clean)
 
@@ -604,9 +737,11 @@ STRIDE_FRAMES = 40        # 0.8s (no overlap)
 
 **Out of Memory Errors:**
 - Reduce `BATCH_SIZE` (micro-batch per forward pass) in `.env`
-- Set `MACRO_BATCH_SIZE` to the desired effective batch; the trainer accumulates
-  `MACRO_BATCH_SIZE / BATCH_SIZE` micro-batches before each optimizer step
-  (e.g. `BATCH_SIZE=2`, `MACRO_BATCH_SIZE=16` → 8 accumulation steps)
+- Stage 2 / ASR trainers: set `MACRO_BATCH_SIZE` for gradient accumulation
+  (`MACRO_BATCH_SIZE / BATCH_SIZE` micro-batches per optimizer step)
+- Stage 1 softmax InfoNCE: `MACRO_BATCH_SIZE` is the **InfoNCE** batch (GradCache);
+  keep `BATCH_SIZE` small for VRAM (e.g. `BATCH_SIZE=8`, `MACRO_BATCH_SIZE=128`).
+  `MACRO_BATCH_SIZE` must be a multiple of `BATCH_SIZE`
 - Process fewer files in batch mode
 
 **Poor Summarization Quality:**

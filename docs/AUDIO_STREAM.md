@@ -9,30 +9,26 @@
 5. [Complete Training Pipeline](#5-complete-training-pipeline)
 6. [Component 2: Streaming Adapter Network](#6-component-2-streaming-adapter-network)
 7. [Component 3: Turn-End Commit Gate](#7-component-3-turn-end-commit-gate)
-   - [VAD vs Turn Detection](#71-vad-vs-turn-detection)
-   - [Combining VAD + Turn Detection](#combining-vad--turn-detection)
-   - [Gate Training and Configuration](#72-gate-training-and-configuration)
-   - [Checkpoint Migration](#73-checkpoint-migration)
-   - [Gate Design Comparison](#74-gate-design-comparison)
+  - [VAD vs Turn Detection](#71-vad-vs-turn-detection)
+  - [Combining VAD + Turn Detection](#combining-vad--turn-detection)
+  - [Gate Training and Configuration](#72-gate-training-and-configuration)
+  - [Checkpoint Migration](#73-checkpoint-migration)
+  - [Gate Design Comparison](#74-gate-design-comparison)
 8. [Loss Functions by Training Stage](#8-loss-functions-by-training-stage)
 9. [Stage 1: Contrastive Audio–Text Alignment](#9-stage-1-contrastive-audiotext-alignment)
-   - [The Cone Collapse Problem](#91-the-cone-collapse-problem)
-   - [The Fix: Batch Centering](#92-the-fix-batch-centering)
+  - [The Cone Collapse Problem](#91-the-cone-collapse-problem)
+  - [The Fix: Batch Centering](#92-the-fix-batch-centering)
 10. [Stage 2: Content Preservation (ASR Distillation)](#10-stage-2-content-preservation-asr-distillation)
 11. [Stage 3: Task Distillation (Streaming)](#11-stage-3-task-distillation-streaming)
 12. [Evaluation Strategy](#12-evaluation-strategy)
 13. [Baseline: SALMONN-7B](#13-baseline-salmonn-7b)
-    - [What SALMONN Does Well](#131-what-salmonn-does-well)
+  - [What SALMONN Does Well](#131-what-salmonn-does-well)
     - [Why Cosine Retrieval is Misleading for SALMONN](#132-why-cosine-retrieval-is-misleading-for-salmonn)
     - [Evaluation Script](#133-evaluation-script)
 14. [Our System vs. SALMONN Baseline](#14-our-system-vs-salmonn-baseline)
 15. [Key Differences Summary](#15-key-differences-summary)
 16. [Theoretical Foundation](#16-theoretical-foundation)
 17. [Related Work](#17-related-work)
-
-
-
-
 
 ## 1. Problem Statement
 
@@ -42,10 +38,6 @@ Audio encoders (e.g. Whisper) produce dense frame sequences at tens of frames pe
 2. **Latency**: The LLM must wait for the entire audio stream before generating any response.
 
 Neither batch speech-to-text (ASR pipeline → LLM) nor direct frame injection is suitable for real-time, low-latency audio-LLM interaction.
-
-
-
-
 
 ## 2. Solution Overview
 
@@ -58,20 +50,19 @@ Target latency: sub-window first-token (< 0.8s from speech onset)
 
 Only the adapter (and optionally the early-commit gate) are trained. The audio encoder and LLM remain completely frozen throughout all stages.
 
-
-
-
-
 ## 3. System Architecture (4 Components)
 
-| # | Component | Module (Trainable) | Role |
-|---|-----------|--------------------|------|
-| 1 | Audio encoder | `whisper_encoder.py`  (Frozen) | Mono 16 kHz waveform → Whisper encoder hidden states |
-| 2 | Streaming adapter | `streaming_adapter.py`  (Yes) | Encoder frames → compressed LLM-space tokens |
-| 3 | Turn-end commit gate | `turn_end_commit_gate.py`  (Yes) (stage 2/3) | When to start LLM generation |
-| 4 | Causal LLM | `qwen.py`  (Frozen) | Text generation (Qwen3-8B) |
+
+| #   | Component            | Module (Trainable)                          | Role                                                 |
+| --- | -------------------- | ------------------------------------------- | ---------------------------------------------------- |
+| 1   | Audio encoder        | `whisper_encoder.py` (Frozen)               | Mono 16 kHz waveform → Whisper encoder hidden states |
+| 2   | Streaming adapter    | `streaming_adapter.py` (Yes)                | Encoder frames → compressed LLM-space tokens         |
+| 3   | Turn-end commit gate | `turn_end_commit_gate.py` (Yes) (stage 2/3) | When to start LLM generation                         |
+| 4   | Causal LLM           | `qwen.py` (Frozen)                          | Text generation (Qwen3-8B)                           |
+
 
 Module paths:
+
 - `src/encoder/whisper_encoder.py`
 - `src/adapter/streaming_adapter.py`
 - `src/adapter/turn_end_commit_gate.py`
@@ -82,10 +73,6 @@ Module paths:
 **Whisper canvas:** Each chunk is mel-padded to 3000 frames (30 s). The encoder always outputs **T = 1500** frames per chunk. **No post-encode trimming** is applied — short windows still produce `(1, 1500, 768)`.
 
 **Current LLM:** Qwen3-8B (`D_llm = 4096`). Swapping LLMs requires only changing the adapter output projection.
-
-
-
-
 
 ## 4. Complete Inference Pipeline
 
@@ -140,10 +127,12 @@ End of audio (no commit):
 
 **Prompt modes:**
 
-| Mode | LLM prefix | When |
-|---|------------|------|
-| `train_style_asr=True` | audio tokens only | Stage 1–2 ASR eval |
-| Chat prompt | `[prompt_embeds \| Z_{1:t}]` | Stage 3 / summarization |
+
+| Mode                   | LLM prefix                  | When                    |
+| ---------------------- | --------------------------- | ----------------------- |
+| `train_style_asr=True` | audio tokens only           | Stage 1–2 ASR eval      |
+| Chat prompt            | `[prompt_embeds | Z_{1:t}]` | Stage 3 / summarization |
+
 
 **Demo:** `examples/streaming_demo.py`
 
@@ -180,14 +169,12 @@ Text output
 
 ### 4.3 Inference checklist by checkpoint
 
-| Checkpoint | Pipeline class | Rate ctrl | Gate |
-|------------|----------------|-----------|------|
-| Stage 1 | `WhisperAdapterLLMPipeline` | Off | Off |
-| Stage 2 | `WhisperAdapterLLMCommitGatePipeline` | On | On |
-| Stage 3 | `WhisperAdapterLLMCommitGatePipeline` | On | On |
 
-
-
+| Checkpoint | Pipeline class                        | Rate ctrl | Gate |
+| ---------- | ------------------------------------- | --------- | ---- |
+| Stage 1    | `WhisperAdapterLLMPipeline`           | Off       | Off  |
+| Stage 2    | `WhisperAdapterLLMCommitGatePipeline` | On        | On   |
+| Stage 3    | `WhisperAdapterLLMCommitGatePipeline` | On        | On   |
 
 
 ## 5. Complete Training Pipeline
@@ -305,18 +292,16 @@ L = L_task + λ_asr·L_asr + λ_stability·L_stability + λ_rate·L_rate
 
 ### 5.5 Training vs inference
 
-| Aspect | Training | Inference (streaming) |
-|-----|----------|------------------------|
-| Audio scope | Full utterance, all windows | Chunk-by-chunk over time |
-| Whisper output | `(1, 1500, 768)` per window, no trim | Same |
-| Adapter | Gradients on; EMA state updated | Eval; EMA carried across windows |
-| Rate controller | Soft gating + losses | Hard zero inactive slots |
-| Gate | L_gate BCE | `should_commit` triggers decode |
-| LLM | Frozen; CE or KL for loss only | KV-cache append + `generate` |
-| Token delivery | Concat all windows, one LM forward | Incremental append per window |
 
-
-
+| Aspect          | Training                             | Inference (streaming)            |
+| --------------- | ------------------------------------ | -------------------------------- |
+| Audio scope     | Full utterance, all windows          | Chunk-by-chunk over time         |
+| Whisper output  | `(1, 1500, 768)` per window, no trim | Same                             |
+| Adapter         | Gradients on; EMA state updated      | Eval; EMA carried across windows |
+| Rate controller | Soft gating + losses                 | Hard zero inactive slots         |
+| Gate            | L_gate BCE                           | `should_commit` triggers decode  |
+| LLM             | Frozen; CE or KL for loss only       | KV-cache append + `generate`     |
+| Token delivery  | Concat all windows, one LM forward   | Incremental append per window    |
 
 
 ## 6. Component 2: Streaming Adapter Network
@@ -327,20 +312,24 @@ L = L_task + λ_asr·L_asr + λ_stability·L_stability + λ_rate·L_rate
 
 Each layer (`src/adapter/cross_attention.py::QFormerLayer`) has three sub-layers:
 
-| Sub-layer | Operation | Purpose |
-|--------|-----------|---------|
-| Self-Attention | Q ↔ Q | Queries coordinate to avoid redundancy |
-| Cross-Attention | Q → F | Queries extract information from encoder frames |
-| FFN | Per-token nonlinear | Expressiveness / feature transformation |
+
+| Sub-layer       | Operation           | Purpose                                         |
+| --------------- | ------------------- | ----------------------------------------------- |
+| Self-Attention  | Q ↔ Q               | Queries coordinate to avoid redundancy          |
+| Cross-Attention | Q → F               | Queries extract information from encoder frames |
+| FFN             | Per-token nonlinear | Expressiveness / feature transformation         |
+
 
 ### Why Cross-Attention with Learnable Queries?
 
-| Option | Problem |
-|--------|---------|
-| Average pooling | Destroys temporal order — "hello world" = "world hello" |
-| Strided CNN | Rigid, content-independent — silence gets same weight as phonemes |
-| Q-Former (chosen) | Content-adaptive; queries specialize via
- self-attention; decoupled from input length |
+
+| Option                                      | Problem                                                           |
+| ------------------------------------------- | ----------------------------------------------------------------- |
+| Average pooling                             | Destroys temporal order — "hello world" = "world hello"           |
+| Strided CNN                                 | Rigid, content-independent — silence gets same weight as phonemes |
+| Q-Former (chosen)                           | Content-adaptive; queries specialize via                          |
+| self-attention; decoupled from input length |                                                                   |
+
 
 ### Cross-Attention Layer Placement
 
@@ -355,12 +344,14 @@ Each layer (`src/adapter/cross_attention.py::QFormerLayer`) has three sub-layers
 **Mechanism**: `Z'_t = α · Z_t + (1 − α) · Z'_{t-1}`,  α ≈ 0.8
 
 **Why EMA**:
+
 - Recency bias: Old windows decay — correct for causal streaming
 - No added parameters (or one scalar α if learnable)
 - Causal: Depends only on past windows, never future
 - Proven: Analogous to batch norm running stats
 
 **Mechanism vs. Loss** (these are separate):
+
 - **EMA** is the inference-time smoothing mechanism
 - **Stability loss** `L_stability = Σ_t ||Z_t − Z_{t-1}||²` is the training signal that penalises large jumps between adjacent windows
 
@@ -374,14 +365,11 @@ Dynamically selects how many of the m query slots to activate per window:
 - Dense speech → 3–4 tokens
 
 Losses produced:
+
 - `L_sparse`: L1 on gate scores — encourages using fewer tokens
 - `L_rate`: MSE between effective token count and target rate R
 
 Inference uses hard thresholding; training uses soft gating.
-
-
-
-
 
 ## 7. Component 3: Turn-End Commit Gate
 
@@ -392,14 +380,16 @@ Inference uses hard thresholding; training uses soft gating.
 These are often confused because both affect *when the agent speaks*, but they answer
 **different questions** at **different levels**.
 
-| | VAD (Voice Activity Detection) | Turn detection (e.g. Smart Turn) |
-|---|---|---|
-| **Question** | Is there **speech** or **silence** right now? | Has the user **finished their turn** (or will they continue)? |
-| **Input** | Raw audio (energy, lightweight ML) | Raw audio or encoded tokens (prosody, phrasing, context) |
-| **Output** | Speech / non-speech | Turn **complete** vs **incomplete** |
-| **Typical model** | Silero VAD | Smart Turn V3, our `TurnEndCommitGate` |
-| **When it runs** | Continuously, cheap | After a candidate pause (often post-VAD) or every streaming window |
-| **Knows content?** | No — silence after any speech looks the same | Yes — distinguishes real turn ends from backchannels and mid-thought pauses |
+
+|                    | VAD (Voice Activity Detection)                | Turn detection (e.g. Smart Turn)                                            |
+| ------------------ | --------------------------------------------- | --------------------------------------------------------------------------- |
+| **Question**       | Is there **speech** or **silence** right now? | Has the user **finished their turn** (or will they continue)?               |
+| **Input**          | Raw audio (energy, lightweight ML)            | Raw audio or encoded tokens (prosody, phrasing, context)                    |
+| **Output**         | Speech / non-speech                           | Turn **complete** vs **incomplete**                                         |
+| **Typical model**  | Silero VAD                                    | Smart Turn V3, our `TurnEndCommitGate`                                      |
+| **When it runs**   | Continuously, cheap                           | After a candidate pause (often post-VAD) or every streaming window          |
+| **Knows content?** | No — silence after any speech looks the same  | Yes — distinguishes real turn ends from backchannels and mid-thought pauses |
+
 
 **VAD** segments the waveform into “someone is talking” vs “nobody is talking.” It does
 not know *why* there is silence or whether the user is done.
@@ -417,10 +407,12 @@ User:   "ok"          ← short ack, still listening
         [silence]
 ```
 
-| Stage | VAD says | Turn detection says | Agent should respond? |
-|---|---|---|---|
-| After user says "ok" | Silence detected | **Incomplete** — backchannel, not a handoff | **No** — keep listening |
-| User finishes a real question | Silence detected | **Complete** — turn ended | **Yes** — generate |
+
+| Stage                         | VAD says         | Turn detection says                         | Agent should respond?   |
+| ----------------------------- | ---------------- | ------------------------------------------- | ----------------------- |
+| After user says "ok"          | Silence detected | **Incomplete** — backchannel, not a handoff | **No** — keep listening |
+| User finishes a real question | Silence detected | **Complete** — turn ended                   | **Yes** — generate      |
+
 
 Smart Turn’s training data explicitly includes **midfiller** / **endfiller** clips
 (short utterances like “ok”, “yes”, “mm-hmm”) labeled complete vs incomplete so the model
@@ -435,27 +427,29 @@ Audio stream
   ↓  should_commit → LLM generate
 ```
 
-- **`TurnEndCommitGate`** combines turn detection + token-based silence tracking (no separate VAD model)
+- `**TurnEndCommitGate**` combines turn detection + token-based silence tracking (no separate VAD model)
 - To reject unwanted commits on “ok / yes / uh-huh”, train the gate on **Smart Turn**
-  `endpoint_bool` labels (`GATE_LABEL_SOURCE=smart_turn`). Synthetic LibriSpeech labels
-  (last window = complete) do not teach backchannel behavior.
+`endpoint_bool` labels (`GATE_LABEL_SOURCE=smart_turn`). Synthetic LibriSpeech labels
+(last window = complete) do not teach backchannel behavior.
 
 #### Combining VAD + turn detection
 
 VAD and turn detection are **complementary** — the gate combines both:
 
-| Layer | Mechanism | Blocks commit when… |
-|---|---|---|
-| **Silence (VAD)** | :class:`SilenceTracker` — token activity from ``Z_t`` | User is **actively speaking** (low token activity window) |
-| **Turn-end** | Smart Turn-style head on `Z_{1:t}` | Pause is a **backchannel** ("ok", "yes") not a handoff |
 
-**Inference rule** (when ``require_silence_for_commit=True``, default):
+| Layer             | Mechanism                                           | Blocks commit when…                                       |
+| ----------------- | --------------------------------------------------- | --------------------------------------------------------- |
+| **Silence (VAD)** | :class:`SilenceTracker` — token activity from `Z_t` | User is **actively speaking** (low token activity window) |
+| **Turn-end**      | Smart Turn-style head on `Z_{1:t}`                  | Pause is a **backchannel** ("ok", "yes") not a handoff    |
+
+
+**Inference rule** (when `require_silence_for_commit=True`, default):
 
 ```python
 should_commit = (commit_prob > threshold) AND silence_tracker.silence_ready
 ```
 
-``silence_ready`` means: not in speech **and** trailing silence ≥ ``min_silence_ms`` (default 200 ms).
+`silence_ready` means: not in speech **and** trailing silence ≥ `min_silence_ms` (default 200 ms).
 
 **Classifier joint input** — silence features are concatenated with pooled adapter tokens:
 
@@ -464,20 +458,22 @@ silence_features = [silence_indicator, silence_duration_norm, activity_prob]  # 
 logit = classifier(concat(attention_pool(Z_{1:t}), silence_features))
 ```
 
-Use ``SilenceTracker.update_from_window_tokens(window_tokens=Z_t)`` each step, or
-``gate.make_silence_tracker()``.
+Use `SilenceTracker.update_from_window_tokens(window_tokens=Z_t)` each step, or
+`gate.make_silence_tracker()`.
 
-Env: ``GATE_MIN_SILENCE_MS``, ``GATE_REQUIRE_SILENCE``, ``GATE_TOKEN_ACTIVITY_THRESHOLD``.
+Env: `GATE_MIN_SILENCE_MS`, `GATE_REQUIRE_SILENCE`, `GATE_TOKEN_ACTIVITY_THRESHOLD`.
 
 > **This is NOT the rate controller.** They solve different problems.
 
-| | Rate Controller | Turn-End Commit Gate |
-|---|---|---|
-| Question | "How many tokens for THIS window?" | "Has the user stopped speaking → start LLM?" |
-| Scope | Per-window | Per-stream |
-| Part of | Component 2 (adapter, optional) | Component 3 (separate module) |
-| Loss | L_sparse + L_rate | L_gate (BCE + optional latency) |
-| Replaces | — | Separate VAD + turn detection (e.g. SmartTurn) |
+
+|          | Rate Controller                    | Turn-End Commit Gate                           |
+| -------- | ---------------------------------- | ---------------------------------------------- |
+| Question | "How many tokens for THIS window?" | "Has the user stopped speaking → start LLM?"   |
+| Scope    | Per-window                         | Per-stream                                     |
+| Part of  | Component 2 (adapter, optional)    | Component 3 (separate module)                  |
+| Loss     | L_sparse + L_rate                  | L_gate (BCE + optional latency)                |
+| Replaces | —                                  | Separate VAD + turn detection (e.g. SmartTurn) |
+
 
 The gate operates on accumulated adapter tokens `Z_{1:t}` **plus silence features**
 from :class:`SilenceTracker` using a **Smart Turn-style** attention pool + classifier:
@@ -498,7 +494,7 @@ LLM decode remain — no separate encode-at-turn-end step.
 **L_gate**:
 
 - **Primary**: BCE on turn-end labels (`endpoint_bool` from Smart Turn, or synthetic
-  last-window labels on LibriSpeech)
+last-window labels on LibriSpeech)
 - **Optional latency penalty** (Stage 3 streaming tradeoffs):
 
 ```python
@@ -517,10 +513,12 @@ gate_loss = bce_loss + latency_penalty
 In the unified pipeline, Whisper + adapter run **while the user speaks**, prefilling the LLM
 KV-cache. Latency after turn-end ≈ gate inference + first LLM token.
 
-| | Separate VAD + SmartTurn | TurnEndCommitGate |
-|---|---|---|
-| Input | Raw audio / silence | Accumulated adapter tokens `Z_{1:t}` |
-| Cost at turn-end | Full encode + classify | Attention pool + classifier |
+
+|                  | Separate VAD + SmartTurn | TurnEndCommitGate                    |
+| ---------------- | ------------------------ | ------------------------------------ |
+| Input            | Raw audio / silence      | Accumulated adapter tokens `Z_{1:t}` |
+| Cost at turn-end | Full encode + classify   | Attention pool + classifier          |
+
 
 **Loss (`L_gate`)**:
 
@@ -533,34 +531,40 @@ gate_loss = bce_loss(endpoint_label, logits) + latency_penalty
 
 **Label sources** (`GATE_LABEL_SOURCE` in `training/utils/config.py` → `GateConfig`):
 
-| Mode | Behavior |
-|------|----------|
-| `synthetic` (default) | LibriSpeech full utterances: all windows except the last → `0`; final window → `1` |
-| `smart_turn` | `SmartTurnGateDataset` (`src/dataset/smart_turn_gate.py`); HF id default `pipecat-ai/smart-turn-data-v3.2-train`; each clip has `endpoint_bool` |
+
+| Mode                  | Behavior                                                                                                                                        |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `synthetic` (default) | LibriSpeech full utterances: all windows except the last → `0`; final window → `1`                                                              |
+| `smart_turn`          | `SmartTurnGateDataset` (`src/dataset/smart_turn_gate.py`); HF id default `pipecat-ai/smart-turn-data-v3.2-train`; each clip has `endpoint_bool` |
+
 
 **Trainers**:
 
-| Script | Gate integration |
-|--------|------------------|
-| `training/adapter_asr_trainer.py` | Joint adapter + gate (synthetic); or Smart Turn gate-only branch |
-| `training/adapter_task_trainer.py` | Joint training (synthetic); or Smart Turn gate-only branch |
+
+| Script                             | Gate integration                                                 |
+| ---------------------------------- | ---------------------------------------------------------------- |
+| `training/adapter_asr_trainer.py`  | Joint adapter + gate (synthetic); or Smart Turn gate-only branch |
+| `training/adapter_task_trainer.py` | Joint training (synthetic); or Smart Turn gate-only branch       |
+
 
 Gate is evaluated on full `accumulated_tokens` including the current window at every timestep `t`.
 
 **Environment variables**:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GATE_LABEL_SOURCE` | `synthetic` | `synthetic` or `smart_turn` |
-| `SMART_TURN_DATASET` | `pipecat-ai/smart-turn-data-v3.2-train` | HF dataset id |
-| `SMART_TURN_SPLIT` | `train` | Dataset split |
-| `SMART_TURN_MAX_SAMPLES` | *(none)* | Cap clips for debugging |
-| `GATE_HIDDEN_DIM` | `256` | Pool/classifier hidden size |
-| `GATE_THRESHOLD` | `0.5` | Inference commit threshold |
-| `GATE_LATENCY_WEIGHT` | `0.1` | Latency penalty weight |
-| `GATE_MIN_SILENCE_MS` | `200` | Min trailing silence for `silence_ready` |
-| `GATE_REQUIRE_SILENCE` | `1` | Require silence before `should_commit` |
-| `GATE_TOKEN_ACTIVITY_THRESHOLD` | `8.0` | Mean token L2 norm for speech activity |
+
+| Variable                        | Default                                 | Description                              |
+| ------------------------------- | --------------------------------------- | ---------------------------------------- |
+| `GATE_LABEL_SOURCE`             | `synthetic`                             | `synthetic` or `smart_turn`              |
+| `SMART_TURN_DATASET`            | `pipecat-ai/smart-turn-data-v3.2-train` | HF dataset id                            |
+| `SMART_TURN_SPLIT`              | `train`                                 | Dataset split                            |
+| `SMART_TURN_MAX_SAMPLES`        | *(none)*                                | Cap clips for debugging                  |
+| `GATE_HIDDEN_DIM`               | `256`                                   | Pool/classifier hidden size              |
+| `GATE_THRESHOLD`                | `0.5`                                   | Inference commit threshold               |
+| `GATE_LATENCY_WEIGHT`           | `0.1`                                   | Latency penalty weight                   |
+| `GATE_MIN_SILENCE_MS`           | `200`                                   | Min trailing silence for `silence_ready` |
+| `GATE_REQUIRE_SILENCE`          | `1`                                     | Require silence before `should_commit`   |
+| `GATE_TOKEN_ACTIVITY_THRESHOLD` | `8.0`                                   | Mean token L2 norm for speech activity   |
+
 
 **Streaming inference example**:
 
@@ -597,41 +601,35 @@ after upgrading.
 
 ### 7.4 Gate design comparison
 
-| | Smart Turn V3 | Old EarlyCommitGate | TurnEndCommitGate |
-|---|---|---|---|
-| Input | Raw audio (mel) | Adapter tokens | Adapter tokens |
-| Architecture | Whisper + pool + MLP | Mean pool + MLP | Attention pool + MLP |
-| Training labels | `endpoint_bool` | Latency penalty only | BCE on endpoint + optional latency |
-| Role in stack | Separate turn detector | Generic early commit | Integrated turn-end + silence gating |
-| Implementation | `VAD/smart-turn/` | `early_commit_gate.py` (deprecated) | `turn_end_commit_gate.py` |
 
-
-
-
+|                 | Smart Turn V3          | Old EarlyCommitGate                 | TurnEndCommitGate                    |
+| --------------- | ---------------------- | ----------------------------------- | ------------------------------------ |
+| Input           | Raw audio (mel)        | Adapter tokens                      | Adapter tokens                       |
+| Architecture    | Whisper + pool + MLP   | Mean pool + MLP                     | Attention pool + MLP                 |
+| Training labels | `endpoint_bool`        | Latency penalty only                | BCE on endpoint + optional latency   |
+| Role in stack   | Separate turn detector | Generic early commit                | Integrated turn-end + silence gating |
+| Implementation  | `VAD/smart-turn/`      | `early_commit_gate.py` (deprecated) | `turn_end_commit_gate.py`            |
 
 
 ## 8. Loss Functions by Training Stage
 
 ### Loss inventory
 
-| Loss | Stage introduced | What it does |
-|------|-----------------|-------------|
-| `L_align` | Stage 1 | InfoNCE contrastive — audio tokens vs. text embeddings |
-| `L_stability` | Stage 1 | MSE(Z_t, Z_{t-1}) — temporal smoothness |
-| `L_asr` | Stage 2 | Frozen causal LM loss with teacher-forced text |
-| `L_sparse` | Stage 2 | L1 on rate controller gates — fewer tokens when possible |
-| `L_rate` | Stage 2 | MSE between effective token count and target rate R |
-| `L_gate` | Stage 2/3 | Turn-end BCE (+ optional latency penalty) for commit gate |
-| `L_task` | Stage 3 | KL divergence from teacher LLM distribution |
-| Prefix consistency | Stage 3 | P(y \| Z_{1:t}) ≈ P(y \| Z_{1:t+k}) |
-| Revision penalty | Stage 3 | Penalise changing earlier generated output |
+
+| Loss               | Stage introduced | What it does                                              |
+| ------------------ | ---------------- | --------------------------------------------------------- |
+| `L_align`          | Stage 1          | InfoNCE contrastive — audio tokens vs. text embeddings    |
+| `L_stability`      | Stage 1          | MSE(Z_t, Z_{t-1}) — temporal smoothness                   |
+| `L_asr`            | Stage 2          | Frozen causal LM loss with teacher-forced text            |
+| `L_sparse`         | Stage 2          | L1 on rate controller gates — fewer tokens when possible  |
+| `L_rate`           | Stage 2          | MSE between effective token count and target rate R       |
+| `L_gate`           | Stage 2/3        | Turn-end BCE (+ optional latency penalty) for commit gate |
+| `L_task`           | Stage 3          | KL divergence from teacher LLM distribution               |
+| Prefix consistency | Stage 3          | P(y | Z_{1:t}) ≈ P(y | Z_{1:t+k})                         |
+| Revision penalty   | Stage 3          | Penalise changing earlier generated output                |
+
 
 **Note**: Prefix consistency and revision penalty require the LLM in the forward pass; they are implemented in the training loop, not in the adapter module.
-
-
-
-
-
 
 ## 9. Stage 1: Contrastive Audio–Text Alignment
 
@@ -665,22 +663,19 @@ L_align = InfoNCE(audio_vec, text_vec)
 
 **Checkpoint:** `checkpoints/adapter_stage1.pt`
 
-
-
-
-
-
 ### 9.1 The Cone Collapse Problem
 
 During initial Stage 1 training, the contrastive loss was not learning. Diagnostics showed:
 
-| Metric | Value | Problem |
-|--------|-------|---------|
-| `neg_sim` | 0.40 | Random unrelated pairs had 40% cosine similarity before training |
-| `pos_sim` | flat at 0.65 | Positives could not separate from negatives |
-| `pos_minus_neg` | flat at 0.25 | No real contrastive signal |
-| `train/align` loss | stuck at ln(4) ≈ 1.38 | Loss was not decreasing |
-| `text_std` | 0.008 | Embedding cloud was heavily squashed |
+
+| Metric             | Value                 | Problem                                                          |
+| ------------------ | --------------------- | ---------------------------------------------------------------- |
+| `neg_sim`          | 0.40                  | Random unrelated pairs had 40% cosine similarity before training |
+| `pos_sim`          | flat at 0.65          | Positives could not separate from negatives                      |
+| `pos_minus_neg`    | flat at 0.25          | No real contrastive signal                                       |
+| `train/align` loss | stuck at ln(4) ≈ 1.38 | Loss was not decreasing                                          |
+| `text_std`         | 0.008                 | Embedding cloud was heavily squashed                             |
+
 
 **Root cause: anisotropy of LLM embeddings.**
 
@@ -717,13 +712,10 @@ similarity. A high baseline similarity (the cone) caps that gap; centering reset
 gap can grow as the model learns.
 
 This is a well-documented property of transformer LM embeddings:
+
 - **Ethayarajh (2019)** — first showed BERT/GPT embeddings are highly anisotropic
 - **Gao et al. (2021)** — SimCSE: showed mean-pooled LM embeddings cluster too tightly for similarity without correction
 - **Su et al. (2021)** — proposed full whitening (centering + decorrelation) as a stronger variant
-
-
-
-
 
 ### 9.2 The Fix: Batch Centering
 
@@ -750,14 +742,16 @@ t = F.normalize(t_pooled, dim=-1)
 
 **Effect**: Moves every point so the cloud is centered at the origin. Random pairs now average to near-zero similarity; the meaningful pair-by-pair differences become visible.
 
-| Metric | Before centering | After centering |
-|--------|-----------------|----------------|
-| `text_std` | 0.008 | 0.015 |
-| `audio_std` | 0.012 | 0.0156 |
-| `neg_sim` | 0.40 | ~0 |
-| `pos_sim` | flat at 0.65 | climbing 0 → 0.45 |
-| `pos_minus_neg` | flat at 0.25 | climbing 0 → 0.5 |
-| `train/align` loss | stuck at 1.38 | 2.05 → 1.4 and dropping |
+
+| Metric             | Before centering | After centering         |
+| ------------------ | ---------------- | ----------------------- |
+| `text_std`         | 0.008            | 0.015                   |
+| `audio_std`        | 0.012            | 0.0156                  |
+| `neg_sim`          | 0.40             | ~0                      |
+| `pos_sim`          | flat at 0.65     | climbing 0 → 0.45       |
+| `pos_minus_neg`    | flat at 0.25     | climbing 0 → 0.5        |
+| `train/align` loss | stuck at 1.38    | 2.05 → 1.4 and dropping |
+
 
 **The same centering fix is applied in retrieval eval (`eval_stage1.py` / `eval_stage2.py --metric retrieval-cosine`)** to ensure training and evaluation metrics are consistent.
 
@@ -766,10 +760,6 @@ Check `pooled.std(dim=0).mean()` — it should be near `1/sqrt(D)` (≈ 0.0156 f
 `pos_sim` and `neg_sim` separately, not just the loss — the loss can decrease for the wrong reason
 (e.g. stability collapse) while the gap does not improve. If centering is insufficient at scale, next
 steps are: projection heads (SimCLR-style MLP), full whitening, or learned attention pooling.
-
-
-
-
 
 ## 10. Stage 2: Content Preservation (ASR Distillation)
 
@@ -784,13 +774,10 @@ L = L_asr + λ_align · L_align + λ_stability · L_stability + λ_sparse · L_s
 ```
 
 **New in Stage 2**:
+
 - `L_asr`: Frozen causal LM loss. Audio tokens are prepended to the LLM context; the LLM predicts the correct transcript in teacher-forced mode. Gradients flow back through the adapter only (LLM stays frozen).
 - Optional `AdaptiveRateController` introduced for token efficiency (`L_sparse`).
 - `TurnEndCommitGate` trained jointly (gate loss contribution is small; primary focus is content fidelity).
-
-
-
-
 
 ## 11. Stage 3: Task Distillation (Streaming)
 
@@ -805,14 +792,11 @@ L = L_task + λ_asr · L_asr + λ_stability · L_stability + λ_rate · L_rate +
 ```
 
 **New in Stage 3**:
+
 - `L_task`: KL divergence between the audio-conditioned LLM distribution and the teacher text-only LLM distribution.
 - Prefix consistency: P(y | Z_{1:t}) ≈ P(y | Z_{1:t+k}) — earlier predictions should not change as more audio arrives.
 - Revision penalty: Penalises the LLM for retracting or contradicting earlier generated tokens.
 - `TurnEndCommitGate` is trained to full effect with the task loss backpropagating through the commit decision.
-
-
-
-
 
 ## 12. Evaluation Strategy
 
@@ -826,14 +810,17 @@ Given N audio clips and their N transcripts, rank all transcripts for each audio
 
 **Scoring modes**:
 
-| Mode | Description | When to use |
-|------|-------------|-------------|
-| Cosine | Dot product of pooled + centered + L2-normalized embeddings | Our system (Stage 1+) |
-| NLL | Negative log-likelihood of transcript under LLM conditioned on audio prefix | After Stage 2; also for SALMONN baseline |
+
+| Mode   | Description                                                                 | When to use                              |
+| ------ | --------------------------------------------------------------------------- | ---------------------------------------- |
+| Cosine | Dot product of pooled + centered + L2-normalized embeddings                 | Our system (Stage 1+)                    |
+| NLL    | Negative log-likelihood of transcript under LLM conditioned on audio prefix | After Stage 2; also for SALMONN baseline |
+
 
 Cosine retrieval is O(N) per query after embedding; NLL retrieval is O(N²) over the query set — use smaller N for NLL.
 
 **Implementation**:
+
 - Our system: `evaluation/eval_stage1.py` / `evaluation/eval_stage2.py` with `--metric retrieval-cosine` or `--metric retrieval-nll`
 - SALMONN baseline: `salmonn/SALMONN-7B/eval_librispeech_full_metrics.py`
 
@@ -848,10 +835,6 @@ Generate transcript end-to-end (audio → adapter tokens → LLM → text). Comp
 - First-token latency (time from audio onset to first generated token)
 - Stability: revision rate, prefix-consistency score
 
-
-
-
-
 ## 13. Baseline: SALMONN-7B
 
 We use [SALMONN-7B](https://github.com/bytedance/SALMONN) as our primary baseline for LibriSpeech test-clean evaluation.
@@ -859,6 +842,7 @@ We use [SALMONN-7B](https://github.com/bytedance/SALMONN) as our primary baselin
 **Evaluation script**: `salmonn/SALMONN-7B/eval_librispeech_full_metrics.py`
 
 SALMONN architecture:
+
 - **Audio encoder 1**: Whisper **Large-v2** (frozen) — speech / ASR-style features
 - **Audio encoder 2**: **BEATs** (frozen) — general audio event / non-speech features
 - **Bridge**: Window-level Q-Former (BLIP-2 style) that receives the **concatenation** of both encoder outputs — batch processing, not streaming
@@ -875,6 +859,7 @@ The dual-encoder input (Whisper + BEATs) is a key strength for general audio tas
 ### 13.2 Why Cosine Retrieval is Misleading for SALMONN
 
 SALMONN uses two separate representation spaces:
+
 - **Audio side**: speech_llama_proj(QFormer(audio)) → Vicuna hidden space
 - **Text side**: Vicuna embed_tokens(transcript) → the same Vicuna hidden space
 
@@ -903,14 +888,16 @@ CUDA_VISIBLE_DEVICES=0,1 python eval_librispeech_full_metrics.py \
 
 **Outputs** (all JSON, no `.pt` files):
 
-| File | Contents |
-|------|----------|
+
+| File                                  | Contents                                                      |
+| ------------------------------------- | ------------------------------------------------------------- |
 | `retrieval_metrics_{cosine,nll}.json` | R@1/3/5/10, MRR, median rank (standard and centered variants) |
-| `retrieval_pairs_{cosine,nll}.json` | Per-utterance top-k ranked transcripts with scores |
-| `asr_metrics.json` | avg WER, BLEU-4 |
-| `asr_predictions.json` | Per-utterance reference, prediction, WER |
-| `combined_metrics.json` | All metrics in one file |
-| `partial_retrieval/*.json` | Rolling partial checkpoints (metrics + sim rows as lists) |
+| `retrieval_pairs_{cosine,nll}.json`   | Per-utterance top-k ranked transcripts with scores            |
+| `asr_metrics.json`                    | avg WER, BLEU-4                                               |
+| `asr_predictions.json`                | Per-utterance reference, prediction, WER                      |
+| `combined_metrics.json`               | All metrics in one file                                       |
+| `partial_retrieval/*.json`            | Rolling partial checkpoints (metrics + sim rows as lists)     |
+
 
 **For SALMONN, use `--retrieval_mode nll`** as the primary retrieval metric. NLL measures how well the model's audio representation supports predicting the correct transcript under the LLM — this reflects the model's actual audio understanding regardless of whether audio and text embeddings are aligned in cosine space.
 
@@ -971,39 +958,29 @@ We are evaluating smaller LLMs (e.g. Phi, Qwen3-4B) for further latency reductio
 ### Key Improvements Over SALMONN
 
 1. **Contrastive learning**: Explicit audio–text alignment loss creates a proper joint metric space. Unlike SALMONN's task-completion objective, our Stage 1 model is specifically optimised to produce audio vectors that are close to their matching text vectors and far from non-matching ones. This enables meaningful cosine retrieval.
-
 2. **Removal of BEATs encoder**: SALMONN uses two encoders (Whisper Large-v2 + BEATs) whose outputs are concatenated before the Q-Former. We remove BEATs entirely. For speech-only tasks on LibriSpeech, BEATs adds ~90M parameters and a second encoder pass without contributing features that Whisper does not already provide. The single-encoder design reduces model size, removes the `beats.pt` dependency, and lowers per-window inference cost — all directly supporting the low-latency goal.
-
 3. **Streaming support with monotonic attention** (planned): SALMONN requires complete audio before processing. Our adapter processes each 0.8s window causally, accumulating tokens in the LLM's KV-cache without re-encoding prior windows.
-
 4. **Low latency**: The entire system (Whisper-small, single encoder, 2-layer Q-Former, Qwen3-8B) is designed around the sub-second first-token latency target. Whisper-small, no BEATs pass, shallow adapter, and KV-cache streaming all contribute.
-
 5. **Early-commit gate**: SALMONN always waits for the full audio. Our gate learns to trigger generation as soon as sufficient context is accumulated, trading off latency against accuracy in a learned, data-driven way.
-
-
-
-
 
 ## 15. Key Differences Summary
 
-| Dimension | SALMONN (baseline) | Our System |
-|-----------|-------------------|------------|
-| Audio encoder 1 | Whisper Large-v2 | Whisper **small** |
-| Audio encoder 2 | **BEATs** (audio events) | **None — removed** |
-| Encoder dim | 1280 + BEATs_dim | **768** |
-| LLM | Vicuna 7B / 13B | **Qwen3-8B** (swappable) |
-| Processing mode | Full-utterance batch | **Window streaming** |
-| Attention | Full bidirectional | Q-Former, considering **monotonic** |
-| Alignment training | Task-completion only | **Contrastive** (Stage 1) |
-| Streaming | ✗ | ✓ |
-| Early-commit | ✗ | ✓ |
-| Cosine retrieval | Not meaningful | ✓ (by design) |
-| NLL retrieval | ✓ (meaningful) | ✓ (Stage 2+) |
-| Latency objective | ✗ | ✓ |
-| BEATs dependency | Required (`beats.pt`) | **Removed** |
 
-
-
+| Dimension          | SALMONN (baseline)       | Our System                          |
+| ------------------ | ------------------------ | ----------------------------------- |
+| Audio encoder 1    | Whisper Large-v2         | Whisper **small**                   |
+| Audio encoder 2    | **BEATs** (audio events) | **None — removed**                  |
+| Encoder dim        | 1280 + BEATs_dim         | **768**                             |
+| LLM                | Vicuna 7B / 13B          | **Qwen3-8B** (swappable)            |
+| Processing mode    | Full-utterance batch     | **Window streaming**                |
+| Attention          | Full bidirectional       | Q-Former, considering **monotonic** |
+| Alignment training | Task-completion only     | **Contrastive** (Stage 1)           |
+| Streaming          | ✗                        | ✓                                   |
+| Early-commit       | ✗                        | ✓                                   |
+| Cosine retrieval   | Not meaningful           | ✓ (by design)                       |
+| NLL retrieval      | ✓ (meaningful)           | ✓ (Stage 2+)                        |
+| Latency objective  | ✗                        | ✓                                   |
+| BEATs dependency   | Required (`beats.pt`)    | **Removed**                         |
 
 
 ## 16. Theoretical Foundation
@@ -1016,22 +993,17 @@ We are evaluating smaller LLMs (e.g. Phi, Qwen3-4B) for further latency reductio
 
 **Rate-Distortion**: Target R = m/t tokens/window while maintaining `I(Audio; Tokens) ≈ I(Audio; Text)`.
 
-
-
-
-
 ## 17. Related Work
 
-| System | Relationship |
-|-----|-------------|
-| **SALMONN** (Tang et al. 2023) | Our primary baseline. Window-level Q-Former; we extend to streaming with stability objectives. |
-| **BLIP-2 / Flamingo** | Q-Former / Perceiver resampler concept; we adapt to causal streaming audio. |
-| **MoChA** (Chiu & Raffel 2018) | Monotonic chunkwise attention — candidate for Stage 2/3 attention replacement. |
-| **Moshi / Mini-Omni / LLaMA-Omni** | Low-latency speech interaction systems; serve as latency benchmarks. |
-| **SimCSE** (Gao et al. 2021) | Contrastive sentence embeddings; motivates our centering fix for anisotropy. |
-| **Ethayarajh (2019)** | Characterised LM embedding anisotropy (cone collapse). |
 
-
+| System                             | Relationship                                                                                   |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **SALMONN** (Tang et al. 2023)     | Our primary baseline. Window-level Q-Former; we extend to streaming with stability objectives. |
+| **BLIP-2 / Flamingo**              | Q-Former / Perceiver resampler concept; we adapt to causal streaming audio.                    |
+| **MoChA** (Chiu & Raffel 2018)     | Monotonic chunkwise attention — candidate for Stage 2/3 attention replacement.                 |
+| **Moshi / Mini-Omni / LLaMA-Omni** | Low-latency speech interaction systems; serve as latency benchmarks.                           |
+| **SimCSE** (Gao et al. 2021)       | Contrastive sentence embeddings; motivates our centering fix for anisotropy.                   |
+| **Ethayarajh (2019)**              | Characterised LM embedding anisotropy (cone collapse).                                         |
 
 
 SALMONN NLL numbers serve as the baseline for NLL retrieval and ASR. SALMONN cosine numbers are expected to be low and are reported only for completeness — they do not reflect SALMONN's audio understanding capability.

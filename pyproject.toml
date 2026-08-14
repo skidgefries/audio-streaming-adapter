@@ -20,6 +20,7 @@ dependencies = [
     "torchcodec>=0.11.0",
     "transformers>=5.5.0",
     "wandb>=0.25.1",
+    "optuna>=4.0.0",
 ]
 
 [build-system]

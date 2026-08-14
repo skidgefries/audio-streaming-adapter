@@ -193,7 +193,29 @@ class Stage1Config:
     temperature: float = 0.07
     val_enabled: bool = True
     val_every_steps: int = 1000
+    val_every_epochs: int = 1
     val_max_utterances: int | None = None  # None = full dev-clean
+
+    @classmethod
+    def from_env(cls) -> Stage1Config:
+        val_max_raw = env_str("VAL_MAX_UTTERANCES")
+        val_max_utterances: int | None = None
+        if val_max_raw:
+            normalized = val_max_raw.strip().lower()
+            if normalized in {"all", "none", "unlimited"}:
+                val_max_utterances = None
+            else:
+                val_max_utterances = int(val_max_raw)
+        return cls(
+            epochs=env_int("EPOCHS", 10),
+            lambda_stability=env_float("LAMBDA_STABILITY", 0.1),
+            temperature=env_float("TEMPERATURE", 0.07),
+            val_enabled=env_bool("VAL_ENABLED", True),
+            val_every_steps=env_int("VAL_EVERY_STEPS", 1000),
+            val_every_epochs=env_int("VAL_EVERY_EPOCHS", 1),
+            val_max_utterances=val_max_utterances,
+        )
+
 
 def _parse_llm_max_memory(raw: str | None) -> dict[int | str, str] | None:
     """
