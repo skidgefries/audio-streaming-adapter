@@ -267,6 +267,9 @@ class WhisperAdapterLLMPipeline:
         """Device for ``inputs_embeds`` / ``generate`` (matches sharded LMs)."""
         return llm_input_device(self.llm_model)
 
+    # Qwen3 ``apply_chat_template(..., enable_thinking=False)`` suffix token ids.
+    _QWEN_NO_THINK_TOKEN_IDS: tuple[int, ...] = (151667, 271, 151668, 271)
+
     @staticmethod
     def qwen_no_think_suffix_embeds(
         llm_model: Any,
@@ -277,13 +280,18 @@ class WhisperAdapterLLMPipeline:
         Qwen3 empty ``...`` block to disable chain-of-thought at decode time.
 
         Matches ``apply_chat_template(..., enable_thinking=False)`` suffix.
+        Returns an empty ``(1, 0, D)`` tensor for LMs whose vocab cannot hold
+        those ids (e.g. Vicuna / Llama), so train-style decode stays
+        ``[audio | BOS]`` instead of indexing out of range.
         """
-        no_think_ids = torch.tensor(
-            [[151667, 271, 151668, 271]], device=device, dtype=torch.long
-        )
-        return llm_model.get_input_embeddings()(no_think_ids).to(
-            device=device, dtype=torch_dtype
-        )
+        embedder = llm_model.get_input_embeddings()
+        vocab_size = int(embedder.num_embeddings)
+        hidden = int(embedder.embedding_dim)
+        ids = WhisperAdapterLLMPipeline._QWEN_NO_THINK_TOKEN_IDS
+        if max(ids) >= vocab_size:
+            return torch.zeros(1, 0, hidden, device=device, dtype=torch_dtype)
+        no_think_ids = torch.tensor([list(ids)], device=device, dtype=torch.long)
+        return embedder(no_think_ids).to(device=device, dtype=torch_dtype)
 
     @staticmethod
     def train_style_separator_token_id(tokenizer: Any) -> int:

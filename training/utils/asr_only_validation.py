@@ -60,7 +60,7 @@ def _train_style_prefix_embeds_one(
     torch_dtype: torch.dtype,
     append_im_end: bool,
 ) -> torch.Tensor:
-    """Build ``[audio]`` or ``[audio | im_end/BOS | no_think]`` embeds for one utterance."""
+    """Build ``[audio]`` or ``[audio | im_end/BOS]`` (+ Qwen ``no_think`` when in-vocab)."""
     audio = audio_tokens.to(device=llm_device, dtype=torch_dtype)
     if audio.ndim != 3 or audio.shape[0] != 1:
         raise ValueError(f"Expected audio_tokens shape (1, T, D), got {tuple(audio.shape)}")

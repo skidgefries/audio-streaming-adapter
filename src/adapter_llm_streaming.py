@@ -343,7 +343,8 @@ class WhisperAdapterStreamingSession:
                 self.llm_model, self._kv._input_device, self.torch_dtype
             )
             self._kv.append_embeddings(sep_embed)
-            self._kv.append_embeddings(no_think_embed)
+            if no_think_embed.shape[1] > 0:
+                self._kv.append_embeddings(no_think_embed)
             self._train_style_sep_appended = True
 
         gen_ids = self._kv.generate(

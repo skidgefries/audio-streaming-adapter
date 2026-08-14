@@ -64,11 +64,14 @@ os.environ.setdefault("ENABLE_LLM_GRADIENT_CHECKPOINTING", "true")
 os.environ.setdefault("GPU_LOCK", "true")
 os.environ.setdefault("WANDB_ENABLED", "true")
 os.environ.setdefault("WANDB_RUN_NAME", "adapter_asr_align_vicuna")
-# Epoch-only checkpoints (ignore shared .env SAVE_EVERY_STEPS mid-epoch cadence).
-os.environ["SAVE_EVERY_STEPS"] = "0"
-os.environ["VAL_EVERY_STEPS"] = "0"
-# Cap each validation pass at 100 utterances (override shared .env VAL_MAX_UTTERANCES=all).
-os.environ["VAL_MAX_UTTERANCES"] = "100"
+# ``MAX_STEPS`` (unset/0 = full run) is for smoke tests; keep epoch-only save/val otherwise.
+MAX_STEPS = env_int("MAX_STEPS", 0)
+if MAX_STEPS <= 0:
+    # Epoch-only checkpoints (ignore shared .env SAVE_EVERY_STEPS mid-epoch cadence).
+    os.environ["SAVE_EVERY_STEPS"] = "0"
+    os.environ["VAL_EVERY_STEPS"] = "0"
+    # Cap each validation pass at 100 utterances (override shared .env VAL_MAX_UTTERANCES=all).
+    os.environ["VAL_MAX_UTTERANCES"] = "100"
 
 _hf_endpoint = apply_hf_hub_endpoint(_pkg_root)
 print(f"HF Hub endpoint: {_hf_endpoint}")
@@ -934,6 +937,8 @@ def train() -> None:
     if ctx.is_main:
         print("\nStarting ASR + align + stability training (Vicuna)")
         print(f"  Dataset: {', '.join(os.path.basename(r) for r in DATASET_ROOTS)}")
+        if MAX_STEPS > 0:
+            print(f"  MAX_STEPS: {MAX_STEPS} (smoke-test cap)")
         print(
             f"  Epochs: {STAGE.epochs} | micro-batch: {DATA.batch_size} | "
             f"effective: {effective_batch_size} | ASR CE chunk: {STAGE.asr_micro_batch_size}"
@@ -965,6 +970,7 @@ def train() -> None:
         print(f"  Stage 3 target: {DEFAULT_ASR_PROMPT[:72]}...\n")
 
     adapter_module = _unwrap(adapter)
+    stop_training = False
 
     for epoch in range(start_epoch, STAGE.epochs):
         if sampler is not None:
@@ -1185,9 +1191,18 @@ def train() -> None:
                     logit_scale=logit_scale,
                 )
 
+            if MAX_STEPS > 0 and optimizer_stepped and pipeline.global_step >= MAX_STEPS:
+                if ctx.is_main:
+                    print(f"Reached MAX_STEPS={MAX_STEPS}; stopping.", flush=True)
+                stop_training = True
+                break
+
             if llm_device.type == "cuda":
                 with torch.cuda.device(llm_device):
                     torch.cuda.empty_cache()
+
+        if stop_training:
+            break
 
         if ctx.is_main:
             _run_dev_clean_validation(
